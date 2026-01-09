@@ -102,7 +102,7 @@
 
     <h1>🎬 Movie DB Manager</h1>
 
-    <div hidden class="section">
+    <div class="section">
         <input type="password" id="appSecret" placeholder="App Secret (or use URL path)">
     </div>
 
@@ -149,7 +149,7 @@
             secretInput.value = urlSecret;
             localStorage.setItem('movieAppSecret', urlSecret);
             // Optional: Hide the input if secret is found in URL
-            // secretInput.parentElement.style.display = 'none';
+			secretInput.parentElement.style.display = 'none';
         } else if(localStorage.getItem('movieAppSecret')) {
             // 2. Check LocalStorage
             secretInput.value = localStorage.getItem('movieAppSecret');
