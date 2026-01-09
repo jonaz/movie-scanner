@@ -20,80 +20,140 @@ import (
 	"google.golang.org/api/vision/v1"
 )
 
+// -- CONFIGURATION --
 const (
-	SheetRange = "Sheet1!A:A" // Checks Column A for duplicates
+	SheetRange = "Sheet1!A:A"
+	// Default secret if env var is missing. Change this!
 )
+
+var TmdbApiKey string
+var AppSecret string
+var SpreadsheetID string
 
 // -- EMBEDDED FRONTEND --
 //
 //go:embed index.html
 var indexHTML []byte
 
-var TmdbApiKey string
-var SpreadsheetID string
-
 func main() {
 	TmdbApiKey = os.Getenv("TMDB_API_KEY")
 	SpreadsheetID = os.Getenv("SPREADSHEET_ID")
+	AppSecret = os.Getenv("APP_SECRET")
+
+	if AppSecret == "" {
+		log.Println("APP_SECRET must be defined")
+		return
+	}
 	// 1. Define Handlers
 	mux := http.NewServeMux()
 
+	// Public: Serve HTML
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Write(indexHTML)
 	})
 
+	// Protected: API Endpoints
 	mux.HandleFunc("/api/scan", handleScan)
+	mux.HandleFunc("/api/search", handleSearch) // New Manual Endpoint
 
-	// 2. Wrap with Logging Middleware
-	loggedMux := loggingMiddleware(mux)
+	// 2. Wrap with Middleware (Logging + Auth)
+	// We only apply Auth to /api/ routes
+	finalHandler := loggingMiddleware(authMiddleware(mux))
 
 	// 3. Start Server
 	log.Println("[INFO] Server started at http://localhost:8080")
-	if err := http.ListenAndServe(":8080", loggedMux); err != nil {
+	if err := http.ListenAndServe(":8080", finalHandler); err != nil {
 		log.Fatalf("[FATAL] Server crashed: %v", err)
 	}
 }
 
 // -- MIDDLEWARE --
+
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		log.Printf("[REQ] %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
-
+		log.Printf("[REQ] %s %s", r.Method, r.URL.Path)
 		next.ServeHTTP(w, r)
+		log.Printf("[RES] %s %s (%v)", r.Method, r.URL.Path, time.Since(start))
+	})
+}
 
-		log.Printf("[RES] %s %s completed in %v", r.Method, r.URL.Path, time.Since(start))
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only check auth for API routes
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+
+			clientSecret := r.Header.Get("X-App-Secret")
+			if clientSecret != AppSecret {
+				log.Printf("[AUTH] Failed attempt from %s", r.RemoteAddr)
+				jsonError(w, "Unauthorized: Invalid App Secret", http.StatusUnauthorized, nil)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
 // -- HANDLERS --
 
-func handleScan(w http.ResponseWriter, r *http.Request) {
+// 1. Manual Text Search
+type SearchRequest struct {
+	Query  string `json:"query"`
+	Format string `json:"format"`
+}
+
+func handleSearch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Method not allowed", 405)
 		return
 	}
 
-	// 1. Read Image
-	log.Println("[INFO] Reading image from request...")
-	file, header, err := r.FormFile("image")
+	var req SearchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "Invalid JSON", 400, err)
+		return
+	}
+
+	if req.Query == "" {
+		jsonError(w, "Query cannot be empty", 400, nil)
+		return
+	}
+
+	log.Printf("[INFO] Manual Search: '%s' (%s)", req.Query, req.Format)
+
+	// Reuse the shared processing logic
+	processAndSave(w, req.Query, req.Format)
+}
+
+// 2. Image Scan
+func handleScan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+
+	// Read Image
+	file, _, err := r.FormFile("image")
 	if err != nil {
 		jsonError(w, "Failed to read image", 500, err)
 		return
 	}
 	defer file.Close()
-
 	imgBytes, _ := io.ReadAll(file)
-	log.Printf("[INFO] Image received. Size: %d bytes, Filename: %s", len(imgBytes), header.Filename)
-
-	// Encode to Base64
 	base64Image := base64.StdEncoding.EncodeToString(imgBytes)
 
-	// 2. Google Vision Request
-	log.Println("[INFO] Sending image to Google Cloud Vision API...")
+	// Google Vision
 	ctx := context.Background()
-	visionService, err := vision.NewService(ctx)
+
+	// Creds
+	creds, err := os.ReadFile("credentials.json")
+	if err != nil {
+		jsonError(w, "Missing credentials.json", 500, err)
+		return
+	}
+
+	visionService, err := vision.NewService(ctx, option.WithCredentialsJSON(creds))
 	if err != nil {
 		jsonError(w, "Failed to connect to Vision API", 500, err)
 		return
@@ -112,55 +172,67 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(res.Responses) == 0 || res.Responses[0].FullTextAnnotation == nil {
-		log.Println("[WARN] Vision API returned no text.")
 		jsonError(w, "No text found in image", 400, nil)
 		return
 	}
 
-	// 3. Logic: Find Largest Text & Parse Format
+	// Extract Title & Format
 	annotation := res.Responses[0].FullTextAnnotation
 	combinedTitle, anchorTitle := findLargestTitle(annotation)
 	detectedFormat := detectFormat(annotation.Text)
 
-	log.Printf("[INFO] OCR Result -> Combined: '%s' | Anchor: '%s' | Format: '%s'", combinedTitle, anchorTitle, detectedFormat)
+	log.Printf("[OCR] Combined: '%s' | Anchor: '%s'", combinedTitle, anchorTitle)
 
-	if anchorTitle == "" {
-		jsonError(w, "Could not identify a title (text too small or unclear)", 400, nil)
+	// Try finding movie in TMDB (Fallback logic)
+	finalTitle := ""
+
+	// Check Combined
+	_, err = searchTMDB(combinedTitle)
+	if err == nil {
+		finalTitle = combinedTitle
+	} else {
+		// Check Anchor
+		_, err = searchTMDB(anchorTitle)
+		if err == nil {
+			finalTitle = anchorTitle
+		} else {
+			// Check Cleaned Anchor
+			cleaned := strings.ReplaceAll(anchorTitle, ":", "")
+			cleaned = strings.ReplaceAll(cleaned, "-", " ")
+			_, err = searchTMDB(cleaned)
+			if err == nil {
+				finalTitle = cleaned
+			}
+		}
+	}
+
+	if finalTitle == "" {
+		jsonError(w, "Movie not found in TMDB (OCR read: "+anchorTitle+")", 404, nil)
 		return
 	}
 
-	// 4. Search TMDB (Fallback Strategy)
-	var tmdbData TMDBResult
-	var errSearch error
+	// Proceed to save
+	processAndSave(w, finalTitle, detectedFormat)
+}
 
-	// Attempt 1: Combined Title ("Leonardo DiCaprio Shutter Island")
-	log.Printf("[INFO] Attempt 1 - Searching Combined: '%s'", combinedTitle)
-	tmdbData, errSearch = searchTMDB(combinedTitle)
-
-	// Attempt 2: Anchor Only ("Shutter Island") - if Attempt 1 failed
-	if errSearch != nil && combinedTitle != anchorTitle {
-		log.Printf("[INFO] Attempt 1 failed. Attempt 2 - Searching Anchor: '%s'", anchorTitle)
-		tmdbData, errSearch = searchTMDB(anchorTitle)
-	}
-
-	// Attempt 3: Cleaned Anchor (Remove ":" or "-") - if Attempt 2 failed
-	if errSearch != nil {
-		cleanedTitle := strings.ReplaceAll(anchorTitle, ":", "")
-		cleanedTitle = strings.ReplaceAll(cleanedTitle, "-", " ")
-		log.Printf("[INFO] Attempt 2 failed. Attempt 3 - Searching Cleaned Anchor: '%s'", cleanedTitle)
-		tmdbData, errSearch = searchTMDB(cleanedTitle)
-	}
-
-	if errSearch != nil {
-		jsonError(w, "Movie not found in TMDB after multiple attempts", 404, errSearch)
+// -- CORE LOGIC (Shared by Scan and Manual) --
+func processAndSave(w http.ResponseWriter, query string, format string) {
+	// 1. Search TMDB
+	tmdbData, err := searchTMDB(query)
+	if err != nil {
+		jsonError(w, "Movie not found: "+query, 404, err)
 		return
 	}
 
-	log.Printf("[INFO] TMDB Match -> Title: '%s', Date: %s, Rating: %.1f", tmdbData.Title, tmdbData.ReleaseDate, tmdbData.VoteAverage)
+	// 2. Check Duplicates in Sheets
+	ctx := context.Background()
+	creds, err := os.ReadFile("credentials.json")
+	if err != nil {
+		jsonError(w, "Missing credentials.json", 500, err)
+		return
+	}
 
-	// 5. Check Duplicates in Sheets
-	log.Println("[INFO] Checking Google Sheets for duplicates...")
-	sheetsService, err := sheets.NewService(ctx, option.WithCredentialsFile("credentials.json"))
+	sheetsService, err := sheets.NewService(ctx, option.WithCredentialsJSON(creds))
 	if err != nil {
 		jsonError(w, "Failed to connect to Sheets API", 500, err)
 		return
@@ -174,22 +246,20 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 
 	for _, row := range readRange.Values {
 		if len(row) > 0 && strings.EqualFold(fmt.Sprintf("%v", row[0]), tmdbData.Title) {
-			log.Printf("[INFO] Duplicate found for '%s'. Skipping add.", tmdbData.Title)
-			jsonError(w, "Movie already exists in database", 409, nil)
+			jsonError(w, "Movie already exists: "+tmdbData.Title, 409, nil)
 			return
 		}
 	}
 
-	// 6. Append to Sheet
-	log.Println("[INFO] Appending new row to Sheet...")
+	// 3. Append
 	values := []interface{}{
 		tmdbData.Title,
-		detectedFormat,
+		format,
 		tmdbData.ReleaseDate,
 		tmdbData.Genres,
 		tmdbData.VoteAverage,
 		tmdbData.VoteCount,
-		"", // User rating blank
+		"",
 	}
 
 	vr := &sheets.ValueRange{Values: [][]interface{}{values}}
@@ -199,18 +269,23 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[SUCCESS] Movie '%s' added successfully.", tmdbData.Title)
+	log.Printf("[SUCCESS] Added '%s'", tmdbData.Title)
 
-	// Success Response
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status": "success",
 		"title":  tmdbData.Title,
-		"format": detectedFormat,
+		"format": format,
 	})
 }
 
-// -- INTELLIGENT PARSING --
+// -- HELPERS -- (Same as previous: findLargestTitle, isNoise, detectFormat, searchTMDB, etc)
+// Paste the helper functions (findLargestTitle, isNoise, detectFormat, searchTMDB, jsonError) from the previous answer here.
+// Make sure 'searchTMDB' returns TMDBResult just like before.
+
+// ... [Paste Helpers Here] ...
+
+// -- HELPER FUNCTIONS START --
 
 type TextLine struct {
 	Text   string
@@ -219,11 +294,9 @@ type TextLine struct {
 	Bottom int
 }
 
-// Returns: (combinedTitle, anchorText)
 func findLargestTitle(annotation *vision.TextAnnotation) (string, string) {
 	var candidates []TextLine
 
-	// 1. Flatten all paragraphs
 	for _, page := range annotation.Pages {
 		for _, block := range page.Blocks {
 			for _, paragraph := range block.Paragraphs {
@@ -261,7 +334,6 @@ func findLargestTitle(annotation *vision.TextAnnotation) (string, string) {
 		return "", ""
 	}
 
-	// 2. Find the Anchor (Tallest line)
 	var anchor TextLine
 	maxHeight := 0
 	for _, line := range candidates {
@@ -271,8 +343,6 @@ func findLargestTitle(annotation *vision.TextAnnotation) (string, string) {
 		}
 	}
 
-	// 3. Define the "Sandwich" Span
-	// Expand span to include any other "Huge" lines (like "WARS" in Star Wars)
 	spanTop := anchor.Top
 	spanBottom := anchor.Bottom
 
@@ -285,7 +355,6 @@ func findLargestTitle(annotation *vision.TextAnnotation) (string, string) {
 			dist = anchor.Top - line.Bottom
 		}
 
-		// If a line is Huge (>50%) and Close (<2x height), it extends the main title block
 		if line.Height > int(float64(maxHeight)*0.50) && dist < int(float64(maxHeight)*2.0) {
 			if line.Top < spanTop {
 				spanTop = line.Top
@@ -296,36 +365,25 @@ func findLargestTitle(annotation *vision.TextAnnotation) (string, string) {
 		}
 	}
 
-	// 4. Collect Text
 	var titleParts []TextLine
-
 	for _, line := range candidates {
-		// A. Inside the Span (Sandwich Filling)
-		// Very permissive: capture almost anything inside the main block
 		if line.Top >= spanTop && line.Bottom <= spanBottom {
-			if line.Height > int(float64(maxHeight)*0.10) { // 10% threshold inside sandwich
+			if line.Height > int(float64(maxHeight)*0.10) {
 				titleParts = append(titleParts, line)
 			}
 			continue
 		}
-
-		// B. Outside the Span (Subtitles/Prequels)
 		distToSpan := 0
 		if line.Top > spanBottom {
-			distToSpan = line.Top - spanBottom // Below
+			distToSpan = line.Top - spanBottom
 		} else if line.Bottom < spanTop {
-			distToSpan = spanTop - line.Bottom // Above
+			distToSpan = spanTop - line.Bottom
 		}
-
-		// LOGIC CHANGE HERE:
-		// We lowered the threshold from 0.35 to 0.15 (15%)
-		// This catches "The Way of Water" (Medium) but skips "Directed by..." (Tiny)
 		if distToSpan < int(float64(maxHeight)*0.5) && line.Height > int(float64(maxHeight)*0.15) {
 			titleParts = append(titleParts, line)
 		}
 	}
 
-	// 5. Sort & Join
 	sort.Slice(titleParts, func(i, j int) bool {
 		return titleParts[i].Top < titleParts[j].Top
 	})
@@ -344,31 +402,25 @@ func findLargestTitle(annotation *vision.TextAnnotation) (string, string) {
 
 func isNoise(text string) bool {
 	t := strings.ToLower(text)
-
-	// 1. Too short to be a meaningful title
-	if len(t) < 3 {
+	if len(t) < 2 {
 		return true
 	}
-
-	// 2. Specific Format Keywords to ignore
-	// If the text line contains any of these, we assume it is NOT the movie title.
 	noiseKeywords := []string{
 		"dvd",
-		"bluray", "blu-ray",
+		"bluray",
+		"blu-ray",
 		"video",
 		"4k",
 		"ultra hd",
 		"uhd",
+		"digital",
 		"hdr",
-		"digital", // Often appears as "Digital Copy"
 	}
-
 	for _, keyword := range noiseKeywords {
 		if strings.Contains(t, keyword) {
 			return true
 		}
 	}
-
 	return false
 }
 
@@ -386,24 +438,19 @@ func detectFormat(fullText string) string {
 	return "Unknown"
 }
 
-// -- TMDB API --
-
 type TMDBResult struct {
-	Title       string
-	ReleaseDate string
-	Genres      string
-	VoteAverage float64
-	VoteCount   int
+	Title, ReleaseDate, Genres string
+	VoteAverage                float64
+	VoteCount                  int
 }
-
 type TMDBResponse struct {
 	Results []struct {
-		Title       string  `json:"title"`
+		Title       string
 		ReleaseDate string  `json:"release_date"`
 		GenreIDs    []int   `json:"genre_ids"`
 		VoteAverage float64 `json:"vote_average"`
 		VoteCount   int     `json:"vote_count"`
-	} `json:"results"`
+	}
 }
 
 func searchTMDB(query string) (TMDBResult, error) {
@@ -418,27 +465,38 @@ func searchTMDB(query string) (TMDBResult, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return TMDBResult{}, err
 	}
-
 	if len(data.Results) == 0 {
 		return TMDBResult{}, fmt.Errorf("no results")
 	}
 
 	first := data.Results[0]
-
 	genreMap := map[int]string{
-		28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime",
-		99: "Documentary", 18: "Drama", 10751: "Family", 14: "Fantasy", 36: "History",
-		27: "Horror", 10402: "Music", 9648: "Mystery", 10749: "Romance", 878: "Sci-Fi",
-		10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western",
+		28:    "Action",
+		12:    "Adventure",
+		16:    "Animation",
+		35:    "Comedy",
+		80:    "Crime",
+		99:    "Documentary",
+		18:    "Drama",
+		10751: "Family",
+		14:    "Fantasy",
+		36:    "History",
+		27:    "Horror",
+		10402: "Music",
+		9648:  "Mystery",
+		10749: "Romance",
+		878:   "Sci-Fi",
+		10770: "TV Movie",
+		53:    "Thriller",
+		10752: "War",
+		37:    "Western",
 	}
-
 	var genreNames []string
 	for _, id := range first.GenreIDs {
 		if name, ok := genreMap[id]; ok {
 			genreNames = append(genreNames, name)
 		}
 	}
-
 	return TMDBResult{
 		Title:       first.Title,
 		ReleaseDate: first.ReleaseDate,
@@ -447,8 +505,6 @@ func searchTMDB(query string) (TMDBResult, error) {
 		VoteCount:   first.VoteCount,
 	}, nil
 }
-
-// -- UTILS --
 
 func jsonError(w http.ResponseWriter, msg string, code int, err error) {
 	if err != nil {
@@ -460,3 +516,5 @@ func jsonError(w http.ResponseWriter, msg string, code int, err error) {
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
+
+// -- HELPER FUNCTIONS END --

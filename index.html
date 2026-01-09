@@ -5,73 +5,253 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Movie Scanner</title>
     <style>
-        body { font-family: sans-serif; text-align: center; padding: 20px; background: #f4f4f4; }
-        #preview { width: 100%; max-width: 400px; border-radius: 8px; margin-top: 20px; display: none; }
-        button { background: #007bff; color: white; border: none; padding: 15px 30px; font-size: 18px; border-radius: 5px; cursor: pointer; margin-top: 20px; }
-        button:disabled { background: #ccc; }
-        #status { margin-top: 20px; font-weight: bold; }
-        .input-group { margin: 20px 0; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+            text-align: center; 
+            padding: 20px; 
+            background: #f0f2f5; 
+            max-width: 600px; 
+            margin: 0 auto; 
+            color: #333;
+        }
+        h1 { margin-bottom: 20px; font-size: 1.8rem; }
+        
+        /* Form Elements */
+        input[type="text"], input[type="password"], select { 
+            padding: 12px; 
+            margin: 8px 0; 
+            border-radius: 8px; 
+            border: 1px solid #ddd; 
+            width: 100%; 
+            box-sizing: border-box; 
+            font-size: 16px; 
+            background: #fff;
+        }
+        
+        /* Buttons */
+        button { 
+            background: #007bff; 
+            color: white; 
+            border: none; 
+            cursor: pointer; 
+            font-weight: 600; 
+            padding: 15px; 
+            border-radius: 8px; 
+            width: 100%;
+            font-size: 16px;
+            margin-top: 10px;
+            transition: background 0.2s;
+        }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        button.secondary { background: #6c757d; }
+        button.secondary:hover { background: #5a6268; }
+
+        /* File Input Styling */
+        input[type="file"] {
+            display: none; 
+        }
+        .file-label {
+            display: block;
+            padding: 15px;
+            background: #e9ecef;
+            color: #495057;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-bottom: 10px;
+            border: 2px dashed #ced4da;
+            font-weight: 500;
+        }
+        .file-label:hover { background: #dee2e6; }
+
+        /* Preview Image */
+        #preview { 
+            width: 100%; 
+            border-radius: 8px; 
+            margin-top: 15px; 
+            display: none; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        /* Status Messages */
+        #status { 
+            margin-top: 20px; 
+            margin-bottom: 20px; 
+            font-weight: 500; 
+            padding: 15px; 
+            border-radius: 8px; 
+            line-height: 1.5;
+            display: none; /* Hidden by default */
+        }
+        .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; display: block !important; }
+        .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; display: block !important; }
+        .processing { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; display: block !important; }
+
+        /* Sections */
+        .section { 
+            background: white; 
+            padding: 20px; 
+            margin-bottom: 20px; 
+            border-radius: 12px; 
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05); 
+        }
+        h3 { margin-top: 0; color: #444; font-size: 1.2rem; }
     </style>
 </head>
 <body>
 
-    <h1>🎬 Movie Database Scanner</h1>
-    
-    <div class="input-group">
-        <input type="file" id="cameraInput" accept="image/*" capture="environment">
-    </div>
+    <h1>🎬 Movie DB Manager</h1>
 
-    <img id="preview" alt="Preview">
-    
-    <br>
-    <button id="scanBtn" onclick="uploadPhoto()" disabled>Scan Movie</button>
+    <div hidden class="section">
+        <input type="password" id="appSecret" placeholder="App Secret (or use URL path)">
+    </div>
 
     <div id="status"></div>
 
+    <div class="section">
+        <h3>📷 Scan Cover</h3>
+        
+        <label for="cameraInput" class="file-label">
+            Tap to Take Photo
+        </label>
+        <input type="file" id="cameraInput" accept="image/*" capture="environment">
+        
+        <img id="preview" alt="Preview">
+        
+        <button id="scanBtn" onclick="uploadPhoto()" disabled>Scan Photo</button>
+    </div>
+
+    <div class="section">
+        <h3>⌨️ Manual Entry</h3>
+        <input type="text" id="manualInput" placeholder="Movie Title (e.g. The Matrix)">
+        <select id="manualFormat">
+            <option value="Bluray">Bluray</option>
+            <option value="4K">4K Ultra HD</option>
+            <option value="DVD">DVD</option>
+        </select>
+        <button class="secondary" onclick="manualSearch()">Add by Name</button>
+    </div>
+
+
     <script>
-        const input = document.getElementById('cameraInput');
+        const secretInput = document.getElementById('appSecret');
+        const fileInput = document.getElementById('cameraInput');
         const preview = document.getElementById('preview');
-        const btn = document.getElementById('scanBtn');
+        const scanBtn = document.getElementById('scanBtn');
         const status = document.getElementById('status');
         let selectedFile = null;
 
-        input.addEventListener('change', (e) => {
+        // --- AUTH LOGIC ---
+        // 1. Check URL path (e.g., /mySecretPassword)
+        const urlSecret = window.location.pathname.substring(1); // Remove leading '/'
+
+        if (urlSecret && urlSecret.length > 0) {
+            secretInput.value = urlSecret;
+            localStorage.setItem('movieAppSecret', urlSecret);
+            // Optional: Hide the input if secret is found in URL
+            // secretInput.parentElement.style.display = 'none';
+        } else if(localStorage.getItem('movieAppSecret')) {
+            // 2. Check LocalStorage
+            secretInput.value = localStorage.getItem('movieAppSecret');
+        }
+
+        // Save secret when manually changed
+        secretInput.addEventListener('change', () => {
+            localStorage.setItem('movieAppSecret', secretInput.value);
+        });
+
+        // --- FILE HANDLING ---
+        fileInput.addEventListener('change', (e) => {
             if (e.target.files && e.target.files[0]) {
                 selectedFile = e.target.files[0];
                 preview.src = URL.createObjectURL(selectedFile);
                 preview.style.display = 'block';
-                btn.disabled = false;
-                status.innerText = "Ready to scan.";
+                scanBtn.disabled = false;
+                showStatus("", "hidden"); // Clear status
+                
+                // Scroll to button
+                scanBtn.scrollIntoView({ behavior: 'smooth' });
             }
         });
 
+        // --- API CALLS ---
+
         async function uploadPhoto() {
             if (!selectedFile) return;
+            
+            await performRequest('/api/scan', 'POST', () => {
+                const formData = new FormData();
+                formData.append('image', selectedFile);
+                return formData; // FormData sets its own Content-Type
+            }, {});
+        }
 
-            status.innerText = "Processing... (Reading text & Searching DB)";
-            btn.disabled = true;
+        async function manualSearch() {
+            const query = document.getElementById('manualInput').value;
+            const format = document.getElementById('manualFormat').value;
+            
+            if (!query) {
+                showStatus("Please enter a movie title.", "error");
+                return;
+            }
 
-            const formData = new FormData();
-            formData.append('image', selectedFile);
+            await performRequest('/api/search', 'POST', () => {
+                return JSON.stringify({ query: query, format: format });
+            }, { 'Content-Type': 'application/json' });
+        }
 
+        // Shared Request Logic
+        async function performRequest(url, method, bodyBuilder, extraHeaders) {
+            const secret = secretInput.value;
+            if (!secret) {
+                showStatus("Please enter the App Secret first.", "error");
+                return;
+            }
+
+            showStatus("Processing... This may take a few seconds.", "processing");
+            scanBtn.disabled = true; // Prevent double clicks
+            
             try {
-                const response = await fetch('/api/scan', {
-                    method: 'POST',
-                    body: formData
-                });
+                const headers = { 'X-App-Secret': secret, ...extraHeaders };
+                const body = bodyBuilder();
 
+                const response = await fetch(url, { method, headers, body });
                 const result = await response.json();
 
                 if (response.ok) {
-                    status.innerHTML = `✅ Success!<br>Added: <b>${result.title}</b><br>Format: ${result.format}`;
+                    showStatus(`✅ <b>Success!</b><br>Added: ${result.title}<br>Format: ${result.format}`, "success");
+                    resetForm();
                 } else {
-                    status.innerText = `❌ Error: ${result.error}`;
+                    showStatus(`❌ <b>Error:</b> ${result.error}`, "error");
                 }
             } catch (error) {
-                status.innerText = "❌ Network Error";
+                showStatus("❌ Network Error. Check your connection or server logs.", "error");
                 console.error(error);
             } finally {
-                btn.disabled = false;
+                scanBtn.disabled = false;
+            }
+        }
+
+        function showStatus(msg, type) {
+            status.innerHTML = msg;
+            status.className = type;
+            if (type !== 'hidden') {
+                status.style.display = 'block';
+            } else {
+                status.style.display = 'none';
+            }
+        }
+
+        function resetForm() {
+            // Clear manual inputs
+            document.getElementById('manualInput').value = "";
+            
+            // Clear file inputs if scan was successful
+            if (preview.style.display === 'block') {
+                preview.style.display = 'none';
+                fileInput.value = "";
+                selectedFile = null;
+                scanBtn.disabled = true;
             }
         }
     </script>
