@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Movie Scanner</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding: 20px; background: #f4f4f4; }
+        #preview { width: 100%; max-width: 400px; border-radius: 8px; margin-top: 20px; display: none; }
+        button { background: #007bff; color: white; border: none; padding: 15px 30px; font-size: 18px; border-radius: 5px; cursor: pointer; margin-top: 20px; }
+        button:disabled { background: #ccc; }
+        #status { margin-top: 20px; font-weight: bold; }
+        .input-group { margin: 20px 0; }
+    </style>
+</head>
+<body>
+
+    <h1>🎬 Movie Database Scanner</h1>
+    
+    <div class="input-group">
+        <input type="file" id="cameraInput" accept="image/*" capture="environment">
+    </div>
+
+    <img id="preview" alt="Preview">
+    
+    <br>
+    <button id="scanBtn" onclick="uploadPhoto()" disabled>Scan Movie</button>
+
+    <div id="status"></div>
+
+    <script>
+        const input = document.getElementById('cameraInput');
+        const preview = document.getElementById('preview');
+        const btn = document.getElementById('scanBtn');
+        const status = document.getElementById('status');
+        let selectedFile = null;
+
+        input.addEventListener('change', (e) => {
+            if (e.target.files && e.target.files[0]) {
+                selectedFile = e.target.files[0];
+                preview.src = URL.createObjectURL(selectedFile);
+                preview.style.display = 'block';
+                btn.disabled = false;
+                status.innerText = "Ready to scan.";
+            }
+        });
+
+        async function uploadPhoto() {
+            if (!selectedFile) return;
+
+            status.innerText = "Processing... (Reading text & Searching DB)";
+            btn.disabled = true;
+
+            const formData = new FormData();
+            formData.append('image', selectedFile);
+
+            try {
+                const response = await fetch('/api/scan', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    status.innerHTML = `✅ Success!<br>Added: <b>${result.title}</b><br>Format: ${result.format}`;
+                } else {
+                    status.innerText = `❌ Error: ${result.error}`;
+                }
+            } catch (error) {
+                status.innerText = "❌ Network Error";
+                console.error(error);
+            } finally {
+                btn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>
