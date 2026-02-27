@@ -57,6 +57,7 @@ func main() {
 
 	mux.HandleFunc("/api/scan", handleScan)
 	mux.HandleFunc("/api/search", handleSearch)
+	mux.HandleFunc("/api/barcode", handleBarcode)
 
 	finalHandler := loggingMiddleware(authMiddleware(mux))
 
@@ -213,6 +214,155 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[SUCCESS] Best Match: '%s' (Score: %.2f)", bestMatch.Title, bestScore)
 	processAndSave(w, bestMatch, detectedFormat)
+}
+
+// --- NEW BARCODE LOGIC ---
+type BarcodeRequest struct {
+	UPC string `json:"upc"`
+}
+
+type UPCItemDBResponse struct {
+	Items []struct {
+		Title string `json:"title"`
+	} `json:"items"`
+}
+
+type GinzaResponse struct {
+	Result []struct {
+		Text string `json:"Text"`
+	} `json:"Result"`
+}
+
+func handleBarcode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+
+	var req BarcodeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "Invalid JSON", 400, err)
+		return
+	}
+
+	if req.UPC == "" {
+		jsonError(w, "Barcode cannot be empty", 400, nil)
+		return
+	}
+
+	log.Printf("[INFO] Barcode Scan received: '%s'", req.UPC)
+
+	upcTitle, err := lookupUPC(req.UPC)
+	if err != nil {
+		jsonError(w, fmt.Sprintf("Barcode %s not found in databases", req.UPC), 404, nil)
+		return
+	}
+
+	log.Printf("[INFO] UPC Lookup Success: '%s'", upcTitle)
+
+	detectedFormat := detectFormat(upcTitle)
+	cleanTitle := cleanMovieText(upcTitle)
+	if cleanTitle == "" {
+		cleanTitle = upcTitle // Fallback just in case
+	}
+
+	// Generate search seeds to bypass garbage SKUs and trailing seller notes
+	var seeds []string
+	words := strings.Fields(cleanTitle)
+
+	// 1. Try the full string first
+	if len(words) > 0 {
+		seeds = append(seeds, cleanTitle)
+	}
+
+	// 2. Drop the first word (handles prepended SKUs like "Id1398z John Wick")
+	if len(words) > 1 {
+		seeds = append(seeds, strings.Join(words[1:], " "))
+	}
+
+	// 3. Systematically drop words from the END one-by-one
+	// (handles appended junk like "Digital with Slipcover UK Region B")
+	for i := len(words) - 1; i > 0; i-- {
+		seed := strings.Join(words[:i], " ")
+		seeds = append(seeds, seed)
+	}
+
+	var bestMatch TMDBResult
+	bestScore := 0.0
+	searchedMovies := make(map[string]bool)
+
+	// Run the NLP scoring loop just like the image scanner
+	for _, seed := range seeds {
+		tmdbResults, err := searchTMDBList(seed)
+		if err != nil {
+			continue
+		}
+
+		for _, movie := range tmdbResults {
+			if searchedMovies[movie.Title] {
+				continue
+			}
+			searchedMovies[movie.Title] = true
+
+			// Score the TMDB result against the raw barcode title
+			score := scoreMovieTitle(movie.Title, upcTitle)
+			log.Printf("[UPC-NLP] Evaluated '%s' -> Score: %.2f", movie.Title, score)
+
+			if score > bestScore {
+				bestScore = score
+				bestMatch = movie
+			}
+		}
+	}
+
+	if bestScore == 0 {
+		jsonError(w, "Movie found via UPC but failed to match in TMDB: "+upcTitle, 404, nil)
+		return
+	}
+
+	log.Printf("[SUCCESS] Best UPC Match: '%s' (Score: %.2f)", bestMatch.Title, bestScore)
+	processAndSave(w, bestMatch, detectedFormat)
+}
+
+func lookupUPC(upc string) (string, error) {
+	// 1. Try upcitemdb (Primary Source)
+	resp1, err := http.Get("https://api.upcitemdb.com/prod/trial/lookup?upc=" + upc)
+	if err == nil {
+		defer resp1.Body.Close()
+		var data UPCItemDBResponse
+		if err := json.NewDecoder(resp1.Body).Decode(&data); err == nil {
+			if len(data.Items) > 0 && data.Items[0].Title != "" {
+				log.Printf("[UPC] Found on upcitemdb")
+				return data.Items[0].Title, nil
+			}
+		}
+	}
+
+	// 2. Try ginza.se (Fallback Source)
+	log.Printf("[UPC] Falling back to ginza.se for %s", upc)
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", "https://www.ginza.se/api/Apptus/Autocomplete?searchPrefix="+upc, nil)
+	if err == nil {
+		// Mimic headers exactly from the provided curl
+		req.Header.Set("accept", "*/*")
+		req.Header.Set("accept-language", "en-GB,en;q=0.9,sv-SE;q=0.8,sv;q=0.7,en-US;q=0.6")
+		req.Header.Set("referer", "https://www.ginza.se/")
+		req.Header.Set("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+		req.Header.Set("x-requested-with", "XMLHttpRequest")
+
+		resp2, err := client.Do(req)
+		if err == nil {
+			defer resp2.Body.Close()
+			var ginzaData GinzaResponse
+			if err := json.NewDecoder(resp2.Body).Decode(&ginzaData); err == nil {
+				if len(ginzaData.Result) > 0 && ginzaData.Result[0].Text != "" {
+					return ginzaData.Result[0].Text, nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("barcode not found")
 }
 
 // -- CORE LOGIC --
@@ -397,23 +547,24 @@ func scoreMovieTitle(tmdbTitle string, coverText string) float64 {
 
 	return ratio + bonus
 }
+
 func cleanMovieText(s string) string {
 	lower := strings.ToLower(s)
 
 	// 1. Strip punctuation FIRST.
-	// This turns "blu-ray" into "blu ray" and "director's cut" into "directors cut"
 	reg := regexp.MustCompile(`[^a-zA-Z0-9\s]`)
 	lower = reg.ReplaceAllString(lower, " ")
 
-	// 2. Normalize spaces so things like "blu   ray" become a predictable "blu ray"
+	// 2. Normalize spaces
 	lower = strings.Join(strings.Fields(lower), " ")
 
-	// 3. NOW remove the noise phrases
+	// 3. NOW remove an expanded list of noise phrases (including UPC seller junk)
 	noisePhrases := []string{
-		"4k", "ultra hd", "ultrahd", "blu ray", "bluray", "dvd", "hdr 10", "hdr10", "hdr",
-		"directors cut", "extended edition",
-		"special edition", "collectors edition", "digital copy",
-		"includes digital", "bonus features", "combo pack", "video calibration",
+		"4k", "ultra hd", "ultrahd", "uhd", "blu ray", "bluray", "dvd", "hdr 10", "hdr10", "hdr",
+		"directors cut", "extended edition", "special edition", "collectors edition",
+		"digital copy", "includes digital", "bonus features", "combo pack",
+		"video calibration", "slipcover", "steelbook", "region a", "region b", "region c",
+		"region 1", "region 2", "import", "uk", "us", "eu", "sealed", "new", "used",
 	}
 
 	for _, phrase := range noisePhrases {
@@ -421,7 +572,7 @@ func cleanMovieText(s string) string {
 		lower = strings.ReplaceAll(lower, phrase, " ")
 	}
 
-	// 4. Clean up any leftover awkward spaces caused by the deletions
+	// 4. Clean up any leftover awkward spaces
 	return strings.Join(strings.Fields(lower), " ")
 }
 
@@ -488,6 +639,8 @@ type TMDBResponse struct {
 
 func searchTMDBList(query string) ([]TMDBResult, error) {
 	q := url.QueryEscape(query)
+
+	log.Printf("searchTMDBList: %s", q)
 	resp, err := http.Get(fmt.Sprintf("https://api.themoviedb.org/3/search/movie?api_key=%s&query=%s", TmdbApiKey, q))
 	if err != nil {
 		return nil, err

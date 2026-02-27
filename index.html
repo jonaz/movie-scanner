@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Movie Scanner</title>
+    <script src="https://unpkg.com/html5-qrcode"></script>
     <style>
         body { 
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
@@ -48,9 +49,7 @@
         button.secondary:hover { background: #5a6268; }
 
         /* File Input Styling */
-        input[type="file"] {
-            display: none; 
-        }
+        input[type="file"] { display: none; }
         .file-label {
             display: block;
             padding: 15px;
@@ -81,7 +80,7 @@
             padding: 15px; 
             border-radius: 8px; 
             line-height: 1.5;
-            display: none; /* Hidden by default */
+            display: none; 
         }
         .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; display: block !important; }
         .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; display: block !important; }
@@ -109,7 +108,14 @@
     <div id="status"></div>
 
     <div class="section">
-        <h3>📷 Scan Cover</h3>
+        <h3>🔤 Scan Barcode</h3>
+        <div id="reader" style="width: 100%; display: none; margin-bottom: 15px;"></div>
+        <button id="startBarcodeBtn" onclick="startBarcodeScanner()">Open Barcode Scanner</button>
+        <button id="stopBarcodeBtn" onclick="stopBarcodeScanner()" class="secondary" style="display:none;">Cancel Scanner</button>
+    </div>
+
+    <div class="section">
+        <h3>📷 OCR Cover Scan</h3>
         
         <label for="cameraInput" class="file-label">
             Tap to Take Photo
@@ -118,7 +124,7 @@
         
         <img id="preview" alt="Preview">
         
-        <button id="scanBtn" onclick="uploadPhoto()" disabled>Scan Photo</button>
+        <button id="scanBtn" onclick="uploadPhoto()" disabled>Analyze Cover</button>
     </div>
 
     <div class="section">
@@ -132,7 +138,6 @@
         <button class="secondary" onclick="manualSearch()">Add by Name</button>
     </div>
 
-
     <script>
         const secretInput = document.getElementById('appSecret');
         const fileInput = document.getElementById('cameraInput');
@@ -140,61 +145,86 @@
         const scanBtn = document.getElementById('scanBtn');
         const status = document.getElementById('status');
         let selectedFile = null;
+        let html5QrcodeScanner = null;
 
         // --- AUTH LOGIC ---
-        // 1. Check URL path (e.g., /mySecretPassword)
-        const urlSecret = window.location.pathname.substring(1); // Remove leading '/'
-
+        const urlSecret = window.location.pathname.substring(1); 
         if (urlSecret && urlSecret.length > 0) {
             secretInput.value = urlSecret;
             localStorage.setItem('movieAppSecret', urlSecret);
-            // Optional: Hide the input if secret is found in URL
 			secretInput.parentElement.style.display = 'none';
         } else if(localStorage.getItem('movieAppSecret')) {
-            // 2. Check LocalStorage
             secretInput.value = localStorage.getItem('movieAppSecret');
         }
-
-        // Save secret when manually changed
         secretInput.addEventListener('change', () => {
             localStorage.setItem('movieAppSecret', secretInput.value);
         });
 
-        // --- FILE HANDLING ---
+        // --- BARCODE SCANNER LOGIC ---
+        function startBarcodeScanner() {
+            document.getElementById('reader').style.display = 'block';
+            document.getElementById('startBarcodeBtn').style.display = 'none';
+            document.getElementById('stopBarcodeBtn').style.display = 'inline-block';
+            showStatus("", "hidden");
+
+            html5QrcodeScanner = new Html5QrcodeScanner(
+                "reader",
+                { fps: 10, qrbox: {width: 250, height: 150} },
+                false);
+            
+            html5QrcodeScanner.render(onScanSuccess, onScanFailure);
+        }
+
+        async function onScanSuccess(decodedText, decodedResult) {
+            stopBarcodeScanner();
+            showStatus("Barcode found: " + decodedText + ". Looking up movie...", "processing");
+
+            await performRequest('/api/barcode', 'POST', () => {
+                return JSON.stringify({ upc: decodedText });
+            }, { 'Content-Type': 'application/json' });
+        }
+
+        function onScanFailure(error) { /* Ignore minor failures while scanning */ }
+
+        function stopBarcodeScanner() {
+            if (html5QrcodeScanner) {
+                html5QrcodeScanner.clear();
+                html5QrcodeScanner = null;
+            }
+            document.getElementById('reader').style.display = 'none';
+            document.getElementById('startBarcodeBtn').style.display = 'inline-block';
+            document.getElementById('stopBarcodeBtn').style.display = 'none';
+        }
+
+        // --- OCR FILE HANDLING ---
         fileInput.addEventListener('change', (e) => {
             if (e.target.files && e.target.files[0]) {
                 selectedFile = e.target.files[0];
                 preview.src = URL.createObjectURL(selectedFile);
                 preview.style.display = 'block';
                 scanBtn.disabled = false;
-                showStatus("", "hidden"); // Clear status
-                
-                // Scroll to button
+                showStatus("", "hidden"); 
                 scanBtn.scrollIntoView({ behavior: 'smooth' });
             }
         });
 
         // --- API CALLS ---
-
         async function uploadPhoto() {
             if (!selectedFile) return;
-            
             await performRequest('/api/scan', 'POST', () => {
                 const formData = new FormData();
                 formData.append('image', selectedFile);
-                return formData; // FormData sets its own Content-Type
+                return formData; 
             }, {});
         }
 
         async function manualSearch() {
             const query = document.getElementById('manualInput').value;
             const format = document.getElementById('manualFormat').value;
-            
             if (!query) {
                 showStatus("Please enter a movie title.", "error");
                 return;
             }
-
             await performRequest('/api/search', 'POST', () => {
                 return JSON.stringify({ query: query, format: format });
             }, { 'Content-Type': 'application/json' });
@@ -209,12 +239,11 @@
             }
 
             showStatus("Processing... This may take a few seconds.", "processing");
-            scanBtn.disabled = true; // Prevent double clicks
+            scanBtn.disabled = true; 
             
             try {
                 const headers = { 'X-App-Secret': secret, ...extraHeaders };
                 const body = bodyBuilder();
-
                 const response = await fetch(url, { method, headers, body });
                 const result = await response.json();
 
@@ -243,10 +272,7 @@
         }
 
         function resetForm() {
-            // Clear manual inputs
             document.getElementById('manualInput').value = "";
-            
-            // Clear file inputs if scan was successful
             if (preview.style.display === 'block') {
                 preview.style.display = 'none';
                 fileInput.value = "";
