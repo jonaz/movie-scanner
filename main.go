@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -21,10 +22,7 @@ import (
 )
 
 // -- CONFIGURATION --
-const (
-	SheetRange = "Sheet1!A:A"
-	// Default secret if env var is missing. Change this!
-)
+const SheetRange = "Sheet1!A:A"
 
 var TmdbApiKey string
 var AppSecret string
@@ -44,26 +42,26 @@ func main() {
 		log.Println("APP_SECRET must be defined")
 		return
 	}
-	// 1. Define Handlers
+
+	port := os.Getenv("HTTP_PORT")
+	if port == "" {
+		port = "8080"
+	}
+
 	mux := http.NewServeMux()
 
-	// Public: Serve HTML
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Write(indexHTML)
 	})
 
-	// Protected: API Endpoints
 	mux.HandleFunc("/api/scan", handleScan)
-	mux.HandleFunc("/api/search", handleSearch) // New Manual Endpoint
+	mux.HandleFunc("/api/search", handleSearch)
 
-	// 2. Wrap with Middleware (Logging + Auth)
-	// We only apply Auth to /api/ routes
 	finalHandler := loggingMiddleware(authMiddleware(mux))
 
-	// 3. Start Server
-	log.Println("[INFO] Server started at http://localhost:8080")
-	if err := http.ListenAndServe(":8080", finalHandler); err != nil {
+	log.Println("[INFO] Server started at http://localhost:" + port)
+	if err := http.ListenAndServe(":"+port, finalHandler); err != nil {
 		log.Fatalf("[FATAL] Server crashed: %v", err)
 	}
 }
@@ -81,9 +79,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Only check auth for API routes
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-
 			clientSecret := r.Header.Get("X-App-Secret")
 			if clientSecret != AppSecret {
 				log.Printf("[AUTH] Failed attempt from %s", r.RemoteAddr)
@@ -97,7 +93,6 @@ func authMiddleware(next http.Handler) http.Handler {
 
 // -- HANDLERS --
 
-// 1. Manual Text Search
 type SearchRequest struct {
 	Query  string `json:"query"`
 	Format string `json:"format"`
@@ -122,18 +117,21 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[INFO] Manual Search: '%s' (%s)", req.Query, req.Format)
 
-	// Reuse the shared processing logic
-	processAndSave(w, req.Query, req.Format)
+	results, err := searchTMDBList(req.Query)
+	if err != nil || len(results) == 0 {
+		jsonError(w, "Movie not found: "+req.Query, 404, err)
+		return
+	}
+
+	processAndSave(w, results[0], req.Format)
 }
 
-// 2. Image Scan
 func handleScan(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", 405)
 		return
 	}
 
-	// Read Image
 	file, _, err := r.FormFile("image")
 	if err != nil {
 		jsonError(w, "Failed to read image", 500, err)
@@ -143,10 +141,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	imgBytes, _ := io.ReadAll(file)
 	base64Image := base64.StdEncoding.EncodeToString(imgBytes)
 
-	// Google Vision
 	ctx := context.Background()
-
-	// Creds
 	creds, err := os.ReadFile("credentials.json")
 	if err != nil {
 		jsonError(w, "Missing credentials.json", 500, err)
@@ -176,55 +171,52 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract Title & Format
 	annotation := res.Responses[0].FullTextAnnotation
-	combinedTitle, anchorTitle := findLargestTitle(annotation)
-	detectedFormat := detectFormat(annotation.Text)
+	fullOCRText := annotation.Text
+	detectedFormat := detectFormat(fullOCRText)
 
-	log.Printf("[OCR] Combined: '%s' | Anchor: '%s'", combinedTitle, anchorTitle)
+	// NLP PATH 2 LOGIC
+	seeds := getSeedQueries(annotation)
+	log.Printf("[NLP] Generated Search Seeds: %v", seeds)
 
-	// Try finding movie in TMDB (Fallback logic)
-	finalTitle := ""
+	var bestMatch TMDBResult
+	bestScore := 0.0
 
-	// Check Combined
-	_, err = searchTMDB(combinedTitle)
-	if err == nil {
-		finalTitle = combinedTitle
-	} else {
-		// Check Anchor
-		_, err = searchTMDB(anchorTitle)
-		if err == nil {
-			finalTitle = anchorTitle
-		} else {
-			// Check Cleaned Anchor
-			cleaned := strings.ReplaceAll(anchorTitle, ":", "")
-			cleaned = strings.ReplaceAll(cleaned, "-", " ")
-			_, err = searchTMDB(cleaned)
-			if err == nil {
-				finalTitle = cleaned
+	searchedMovies := make(map[string]bool)
+
+	for _, seed := range seeds {
+		tmdbResults, err := searchTMDBList(seed)
+		if err != nil {
+			continue
+		}
+
+		for _, movie := range tmdbResults {
+			if searchedMovies[movie.Title] {
+				continue
+			}
+			searchedMovies[movie.Title] = true
+
+			score := scoreMovieTitle(movie.Title, fullOCRText)
+			log.Printf("[NLP] Evaluated '%s' -> Score: %.2f", movie.Title, score)
+
+			if score > bestScore {
+				bestScore = score
+				bestMatch = movie
 			}
 		}
 	}
 
-	if finalTitle == "" {
-		jsonError(w, "Movie not found in TMDB (OCR read: "+anchorTitle+")", 404, nil)
+	if bestScore == 0 {
+		jsonError(w, "Could not confidently match a movie from the cover text.", 404, nil)
 		return
 	}
 
-	// Proceed to save
-	processAndSave(w, finalTitle, detectedFormat)
+	log.Printf("[SUCCESS] Best Match: '%s' (Score: %.2f)", bestMatch.Title, bestScore)
+	processAndSave(w, bestMatch, detectedFormat)
 }
 
-// -- CORE LOGIC (Shared by Scan and Manual) --
-func processAndSave(w http.ResponseWriter, query string, format string) {
-	// 1. Search TMDB
-	tmdbData, err := searchTMDB(query)
-	if err != nil {
-		jsonError(w, "Movie not found: "+query, 404, err)
-		return
-	}
-
-	// 2. Check Duplicates in Sheets
+// -- CORE LOGIC --
+func processAndSave(w http.ResponseWriter, tmdbData TMDBResult, format string) {
 	ctx := context.Background()
 	creds, err := os.ReadFile("credentials.json")
 	if err != nil {
@@ -251,7 +243,6 @@ func processAndSave(w http.ResponseWriter, query string, format string) {
 		}
 	}
 
-	// 3. Append
 	values := []interface{}{
 		tmdbData.Title,
 		format,
@@ -269,33 +260,24 @@ func processAndSave(w http.ResponseWriter, query string, format string) {
 		return
 	}
 
-	log.Printf("[SUCCESS] Added '%s'", tmdbData.Title)
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "success",
-		"title":  tmdbData.Title,
-		"format": format,
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":      "success",
+		"title":       tmdbData.Title,
+		"format":      format,
+		"releaseDate": tmdbData.ReleaseDate,
 	})
 }
 
-// -- HELPERS -- (Same as previous: findLargestTitle, isNoise, detectFormat, searchTMDB, etc)
-// Paste the helper functions (findLargestTitle, isNoise, detectFormat, searchTMDB, jsonError) from the previous answer here.
-// Make sure 'searchTMDB' returns TMDBResult just like before.
+// -- NLP PATH 2 HELPERS --
 
-// ... [Paste Helpers Here] ...
-
-// -- HELPER FUNCTIONS START --
-
-type TextLine struct {
-	Text   string
-	Height int
-	Top    int
-	Bottom int
+type TextBlock struct {
+	Text string
+	Area int
 }
 
-func findLargestTitle(annotation *vision.TextAnnotation) (string, string) {
-	var candidates []TextLine
+func getSeedQueries(annotation *vision.TextAnnotation) []string {
+	var blocks []TextBlock
 
 	for _, page := range annotation.Pages {
 		for _, block := range page.Blocks {
@@ -304,7 +286,23 @@ func findLargestTitle(annotation *vision.TextAnnotation) (string, string) {
 					continue
 				}
 				v := paragraph.BoundingBox.Vertices
-				height := v[3].Y - v[0].Y
+				minX, maxX := v[0].X, v[0].X
+				minY, maxY := v[0].Y, v[0].Y
+				for _, pt := range v {
+					if pt.X < minX {
+						minX = pt.X
+					}
+					if pt.X > maxX {
+						maxX = pt.X
+					}
+					if pt.Y < minY {
+						minY = pt.Y
+					}
+					if pt.Y > maxY {
+						maxY = pt.Y
+					}
+				}
+				area := int((maxX - minX) * (maxY - minY))
 
 				var words []string
 				for _, word := range paragraph.Words {
@@ -314,114 +312,117 @@ func findLargestTitle(annotation *vision.TextAnnotation) (string, string) {
 					}
 					words = append(words, strings.Join(symbols, ""))
 				}
-				fullText := strings.Join(words, " ")
 
-				if isNoise(fullText) {
-					continue
+				fullText := strings.TrimSpace(strings.Join(words, " "))
+				cleanText := cleanMovieText(fullText)
+				cleanText = strings.TrimSpace(cleanText)
+
+				// Discard pure numbers (handles "11", but also spaced groups like "9 11 12")
+				isPureNumber, _ := regexp.MatchString(`^[\d\s]+$`, cleanText)
+
+				if len(cleanText) > 1 && !isPureNumber {
+					blocks = append(blocks, TextBlock{Text: cleanText, Area: area})
 				}
-
-				candidates = append(candidates, TextLine{
-					Text:   fullText,
-					Height: int(height),
-					Top:    int(v[0].Y),
-					Bottom: int(v[3].Y),
-				})
 			}
 		}
 	}
 
-	if len(candidates) == 0 {
-		return "", ""
-	}
-
-	var anchor TextLine
-	maxHeight := 0
-	for _, line := range candidates {
-		if line.Height > maxHeight {
-			maxHeight = line.Height
-			anchor = line
-		}
-	}
-
-	spanTop := anchor.Top
-	spanBottom := anchor.Bottom
-
-	for _, line := range candidates {
-		dist := 0
-		if line.Top > anchor.Bottom {
-			dist = line.Top - anchor.Bottom
-		}
-		if line.Bottom < anchor.Top {
-			dist = anchor.Top - line.Bottom
-		}
-
-		if line.Height > int(float64(maxHeight)*0.50) && dist < int(float64(maxHeight)*2.0) {
-			if line.Top < spanTop {
-				spanTop = line.Top
-			}
-			if line.Bottom > spanBottom {
-				spanBottom = line.Bottom
-			}
-		}
-	}
-
-	var titleParts []TextLine
-	for _, line := range candidates {
-		if line.Top >= spanTop && line.Bottom <= spanBottom {
-			if line.Height > int(float64(maxHeight)*0.10) {
-				titleParts = append(titleParts, line)
-			}
-			continue
-		}
-		distToSpan := 0
-		if line.Top > spanBottom {
-			distToSpan = line.Top - spanBottom
-		} else if line.Bottom < spanTop {
-			distToSpan = spanTop - line.Bottom
-		}
-		if distToSpan < int(float64(maxHeight)*0.5) && line.Height > int(float64(maxHeight)*0.15) {
-			titleParts = append(titleParts, line)
-		}
-	}
-
-	sort.Slice(titleParts, func(i, j int) bool {
-		return titleParts[i].Top < titleParts[j].Top
+	sort.Slice(blocks, func(i, j int) bool {
+		return blocks[i].Area > blocks[j].Area
 	})
 
-	var finalTitle []string
+	var seeds []string
 	seen := make(map[string]bool)
-	for _, part := range titleParts {
-		if !seen[part.Text] {
-			finalTitle = append(finalTitle, part.Text)
-			seen[part.Text] = true
+
+	for i := 0; i < len(blocks) && len(seeds) < 3; i++ {
+		if blocks[i].Text != "" && !seen[blocks[i].Text] {
+			seen[blocks[i].Text] = true
+			seeds = append(seeds, blocks[i].Text)
 		}
 	}
-
-	return strings.Join(finalTitle, " "), anchor.Text
+	return seeds
 }
 
-func isNoise(text string) bool {
-	t := strings.ToLower(text)
-	if len(t) < 2 {
-		return true
+func scoreMovieTitle(tmdbTitle string, coverText string) float64 {
+	cleanTitle := cleanMovieText(tmdbTitle)
+	cleanCover := cleanMovieText(coverText)
+
+	titleWords := strings.Fields(cleanTitle)
+	coverWords := strings.Fields(cleanCover)
+
+	if len(titleWords) == 0 || len(coverWords) == 0 {
+		return 0
 	}
-	noiseKeywords := []string{
-		"dvd",
-		"bluray",
-		"blu-ray",
-		"video",
-		"4k",
-		"ultra hd",
-		"uhd",
-		"digital",
-		"hdr",
-	}
-	for _, keyword := range noiseKeywords {
-		if strings.Contains(t, keyword) {
-			return true
+
+	matchCount := 0
+	hasSignificantMatch := false
+
+	for _, w := range titleWords {
+		matched := false
+		for _, cw := range coverWords {
+			if w == cw {
+				matched = true
+				break
+			}
+			// Typo tolerance: If word is >= 5 letters, allow a 1 letter typo
+			if len(w) >= 5 && levenshtein(w, cw) <= 1 {
+				matched = true
+				break
+			}
+		}
+
+		if matched {
+			matchCount++
+			// Check if the matched word is actually a word and not just a digit
+			isNum, _ := regexp.MatchString(`^\d+$`, w)
+			if !isNum && len(w) > 1 {
+				hasSignificantMatch = true
+			}
 		}
 	}
-	return false
+
+	if matchCount == 0 {
+		return 0
+	}
+
+	// PREVENT NUMBER HIJACKING:
+	// If we ONLY matched numbers (like "9", "11", "12"), throw the result out.
+	// Exception: The movie is literally just a number and we matched 100% of it (like the movie "1917").
+	if !hasSignificantMatch && matchCount < len(titleWords) {
+		return 0
+	}
+
+	ratio := float64(matchCount) / float64(len(titleWords))
+	bonus := float64(matchCount) * 0.1
+
+	return ratio + bonus
+}
+func cleanMovieText(s string) string {
+	lower := strings.ToLower(s)
+
+	// 1. Strip punctuation FIRST.
+	// This turns "blu-ray" into "blu ray" and "director's cut" into "directors cut"
+	reg := regexp.MustCompile(`[^a-zA-Z0-9\s]`)
+	lower = reg.ReplaceAllString(lower, " ")
+
+	// 2. Normalize spaces so things like "blu   ray" become a predictable "blu ray"
+	lower = strings.Join(strings.Fields(lower), " ")
+
+	// 3. NOW remove the noise phrases
+	noisePhrases := []string{
+		"4k", "ultra hd", "ultrahd", "blu ray", "bluray", "dvd", "hdr 10", "hdr10", "hdr",
+		"directors cut", "extended edition",
+		"special edition", "collectors edition", "digital copy",
+		"includes digital", "bonus features", "combo pack", "video calibration",
+	}
+
+	for _, phrase := range noisePhrases {
+		// Replace the phrase with a space to avoid squishing words together
+		lower = strings.ReplaceAll(lower, phrase, " ")
+	}
+
+	// 4. Clean up any leftover awkward spaces caused by the deletions
+	return strings.Join(strings.Fields(lower), " ")
 }
 
 func detectFormat(fullText string) string {
@@ -438,11 +439,43 @@ func detectFormat(fullText string) string {
 	return "Unknown"
 }
 
+// levenshtein calculates the distance between two strings for fuzzy typo matching
+func levenshtein(s, t string) int {
+	d := make([][]int, len(s)+1)
+	for i := range d {
+		d[i] = make([]int, len(t)+1)
+		d[i][0] = i
+	}
+	for j := range t {
+		d[0][j+1] = j + 1
+	}
+	for i := 0; i < len(s); i++ {
+		for j := 0; j < len(t); j++ {
+			cost := 1
+			if s[i] == t[j] {
+				cost = 0
+			}
+			min := d[i][j+1] + 1
+			if d[i+1][j]+1 < min {
+				min = d[i+1][j] + 1
+			}
+			if d[i][j]+cost < min {
+				min = d[i][j] + cost
+			}
+			d[i+1][j+1] = min
+		}
+	}
+	return d[len(s)][len(t)]
+}
+
+// -- TMDB API --
+
 type TMDBResult struct {
 	Title, ReleaseDate, Genres string
 	VoteAverage                float64
 	VoteCount                  int
 }
+
 type TMDBResponse struct {
 	Results []struct {
 		Title       string
@@ -453,57 +486,54 @@ type TMDBResponse struct {
 	}
 }
 
-func searchTMDB(query string) (TMDBResult, error) {
+func searchTMDBList(query string) ([]TMDBResult, error) {
 	q := url.QueryEscape(query)
 	resp, err := http.Get(fmt.Sprintf("https://api.themoviedb.org/3/search/movie?api_key=%s&query=%s", TmdbApiKey, q))
 	if err != nil {
-		return TMDBResult{}, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	var data TMDBResponse
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return TMDBResult{}, err
+		return nil, err
 	}
 	if len(data.Results) == 0 {
-		return TMDBResult{}, fmt.Errorf("no results")
+		return nil, fmt.Errorf("no results")
 	}
 
-	first := data.Results[0]
 	genreMap := map[int]string{
-		28:    "Action",
-		12:    "Adventure",
-		16:    "Animation",
-		35:    "Comedy",
-		80:    "Crime",
-		99:    "Documentary",
-		18:    "Drama",
-		10751: "Family",
-		14:    "Fantasy",
-		36:    "History",
-		27:    "Horror",
-		10402: "Music",
-		9648:  "Mystery",
-		10749: "Romance",
-		878:   "Sci-Fi",
-		10770: "TV Movie",
-		53:    "Thriller",
-		10752: "War",
-		37:    "Western",
+		28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy",
+		80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family",
+		14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music",
+		9648: "Mystery", 10749: "Romance", 878: "Sci-Fi", 10770: "TV Movie",
+		53: "Thriller", 10752: "War", 37: "Western",
 	}
-	var genreNames []string
-	for _, id := range first.GenreIDs {
-		if name, ok := genreMap[id]; ok {
-			genreNames = append(genreNames, name)
+
+	var results []TMDBResult
+	limit := 5
+	if len(data.Results) < 5 {
+		limit = len(data.Results)
+	}
+
+	for i := 0; i < limit; i++ {
+		res := data.Results[i]
+		var genreNames []string
+		for _, id := range res.GenreIDs {
+			if name, ok := genreMap[id]; ok {
+				genreNames = append(genreNames, name)
+			}
 		}
+		results = append(results, TMDBResult{
+			Title:       res.Title,
+			ReleaseDate: res.ReleaseDate,
+			Genres:      strings.Join(genreNames, ", "),
+			VoteAverage: res.VoteAverage,
+			VoteCount:   res.VoteCount,
+		})
 	}
-	return TMDBResult{
-		Title:       first.Title,
-		ReleaseDate: first.ReleaseDate,
-		Genres:      strings.Join(genreNames, ", "),
-		VoteAverage: first.VoteAverage,
-		VoteCount:   first.VoteCount,
-	}, nil
+
+	return results, nil
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int, err error) {
@@ -516,5 +546,3 @@ func jsonError(w http.ResponseWriter, msg string, code int, err error) {
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
-
-// -- HELPER FUNCTIONS END --

@@ -219,7 +219,7 @@
                 const result = await response.json();
 
                 if (response.ok) {
-                    showStatus(`✅ <b>Success!</b><br>Added: ${result.title}<br>Format: ${result.format}`, "success");
+					showStatus(`✅ <b>Success!</b><br>Added: ${result.title}<br>Format: ${result.format}<br>Date: ${result.releaseDate}`, "success");
                     resetForm();
                 } else {
                     showStatus(`❌ <b>Error:</b> ${result.error}`, "error");
