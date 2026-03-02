@@ -160,23 +160,45 @@
             localStorage.setItem('movieAppSecret', secretInput.value);
         });
 
-        // --- BARCODE SCANNER LOGIC ---
+		// --- BARCODE SCANNER LOGIC ---
+        let html5QrCode = null;
+
         function startBarcodeScanner() {
             document.getElementById('reader').style.display = 'block';
             document.getElementById('startBarcodeBtn').style.display = 'none';
             document.getElementById('stopBarcodeBtn').style.display = 'inline-block';
-            showStatus("", "hidden");
+            showStatus("Initializing camera...", "processing");
 
-            html5QrcodeScanner = new Html5QrcodeScanner(
-                "reader",
-                { fps: 10, qrbox: {width: 250, height: 150} },
-                false);
-            
-            html5QrcodeScanner.render(onScanSuccess, onScanFailure);
+            // Use the core Html5Qrcode class instead of the pre-built Scanner UI
+            html5QrCode = new Html5Qrcode("reader");
+
+            const config = { 
+                fps: 10, 
+                qrbox: { width: 250, height: 150 },
+                aspectRatio: 1.0
+            };
+
+            // STRICTLY request the rear/environment camera
+            html5QrCode.start({ facingMode: "environment" }, config, onScanSuccess, onScanFailure)
+                .then(() => {
+                    showStatus("Camera active. Point at barcode.", "processing");
+                })
+                .catch((err) => {
+                    showStatus("Camera error: " + err, "error");
+                    stopBarcodeScanner();
+                });
         }
 
         async function onScanSuccess(decodedText, decodedResult) {
-            stopBarcodeScanner();
+            // Stop scanning immediately to prevent duplicate requests
+            if (html5QrCode && html5QrCode.isScanning) {
+                await html5QrCode.stop();
+            }
+            
+            document.getElementById('reader').style.display = 'none';
+            document.getElementById('startBarcodeBtn').style.display = 'inline-block';
+            document.getElementById('stopBarcodeBtn').style.display = 'none';
+            
             showStatus("Barcode found: " + decodedText + ". Looking up movie...", "processing");
 
             await performRequest('/api/barcode', 'POST', () => {
@@ -184,16 +206,27 @@
             }, { 'Content-Type': 'application/json' });
         }
 
-        function onScanFailure(error) { /* Ignore minor failures while scanning */ }
+        function onScanFailure(error) { 
+            // Ignore minor frame failures while it tries to find a barcode
+        }
 
         function stopBarcodeScanner() {
-            if (html5QrcodeScanner) {
-                html5QrcodeScanner.clear();
-                html5QrcodeScanner = null;
+            if (html5QrCode && html5QrCode.isScanning) {
+                html5QrCode.stop().then(() => {
+                    html5QrCode.clear();
+                    html5QrCode = null;
+                }).catch(err => {
+                    console.error("Failed to stop scanner", err);
+                });
+            } else if (html5QrCode) {
+                html5QrCode.clear();
+                html5QrCode = null;
             }
+            
             document.getElementById('reader').style.display = 'none';
             document.getElementById('startBarcodeBtn').style.display = 'inline-block';
             document.getElementById('stopBarcodeBtn').style.display = 'none';
+            showStatus("", "hidden");
         }
 
         // --- OCR FILE HANDLING ---
