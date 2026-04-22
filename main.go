@@ -16,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"google.golang.org/api/option"
 	"google.golang.org/api/sheets/v4"
 	"google.golang.org/api/vision/v1"
@@ -59,6 +58,7 @@ func main() {
 	mux.HandleFunc("/api/scan", handleScan)
 	mux.HandleFunc("/api/search", handleSearch)
 	mux.HandleFunc("/api/barcode", handleBarcode)
+	mux.HandleFunc("/api/save", handleSave)
 
 	finalHandler := loggingMiddleware(authMiddleware(mux))
 
@@ -120,7 +120,15 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	processAndSave(w, results[0], req.Format)
+	for i := range results {
+		results[i].Score = scoreMovieTitle(results[i].Title, req.Query)
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(CandidatesResponse{Candidates: results, Format: req.Format})
 }
 
 func handleScan(w http.ResponseWriter, r *http.Request) {
@@ -176,40 +184,15 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	seeds := getSeedQueries(annotation)
 	log.Printf("[NLP] Generated Search Seeds: %v", seeds)
 
-	var bestMatch TMDBResult
-	bestScore := 0.0
-
-	searchedMovies := make(map[string]bool)
-
-	for _, seed := range seeds {
-		tmdbResults, err := searchTMDBList(seed)
-		if err != nil {
-			continue
-		}
-
-		for _, movie := range tmdbResults {
-			if searchedMovies[movie.Title] {
-				continue
-			}
-			searchedMovies[movie.Title] = true
-
-			score := scoreMovieTitle(movie.Title, fullOCRText)
-			log.Printf("[NLP] Evaluated '%s' -> Score: %.2f", movie.Title, score)
-
-			if score > bestScore {
-				bestScore = score
-				bestMatch = movie
-			}
-		}
-	}
-
-	if bestScore == 0 {
+	candidates := collectCandidates(seeds, fullOCRText)
+	if len(candidates) == 0 {
 		jsonError(w, "Could not confidently match a movie from the cover text.", 404, nil)
 		return
 	}
 
-	log.Printf("[SUCCESS] Best Match: '%s' (Score: %.2f)", bestMatch.Title, bestScore)
-	processAndSave(w, bestMatch, detectedFormat)
+	log.Printf("[SUCCESS] Best Scan Match: '%s' (Score: %.2f)", candidates[0].Title, candidates[0].Score)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(CandidatesResponse{Candidates: candidates, Format: detectedFormat})
 }
 
 func handleBarcode(w http.ResponseWriter, r *http.Request) {
@@ -266,42 +249,15 @@ func handleBarcode(w http.ResponseWriter, r *http.Request) {
 		seeds = append(seeds, seed)
 	}
 
-	var bestMatch TMDBResult
-	bestScore := 0.0
-	searchedMovies := make(map[string]bool)
-
-	// Run the NLP scoring loop just like the image scanner
-	for _, seed := range seeds {
-		tmdbResults, err := searchTMDBList(seed)
-		if err != nil {
-			continue
-		}
-		spew.Dump(tmdbResults)
-
-		for _, movie := range tmdbResults {
-			if searchedMovies[movie.Title] {
-				continue
-			}
-			searchedMovies[movie.Title] = true
-
-			// Score the TMDB result against the raw barcode title
-			score := scoreMovieTitle(movie.Title, upcTitle)
-			log.Printf("[UPC-NLP] Evaluated '%s' -> Score: %.2f", movie.Title, score)
-
-			if score > bestScore {
-				bestScore = score
-				bestMatch = movie
-			}
-		}
-	}
-
-	if bestScore == 0 {
+	candidates := collectCandidates(seeds, upcTitle)
+	if len(candidates) == 0 {
 		jsonError(w, "Movie found via UPC but failed to match in TMDB: "+upcTitle, 404, nil)
 		return
 	}
 
-	log.Printf("[SUCCESS] Best UPC Match: '%s' (Score: %.2f)", bestMatch.Title, bestScore)
-	processAndSave(w, bestMatch, detectedFormat)
+	log.Printf("[SUCCESS] Best UPC Match: '%s' (Score: %.2f)", candidates[0].Title, candidates[0].Score)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(CandidatesResponse{Candidates: candidates, Format: detectedFormat})
 }
 
 func lookupUPC(upc string) (string, error) {
@@ -425,7 +381,55 @@ func lookupKvarnvideo(upc string) (string, error) {
 }
 
 // -- CORE LOGIC --
-func processAndSave(w http.ResponseWriter, tmdbData TMDBResult, format string) {
+
+func collectCandidates(seeds []string, rawText string) []TMDBResult {
+	seenIDs := make(map[int]bool)
+	var candidates []TMDBResult
+
+	for _, seed := range seeds {
+		tmdbResults, err := searchTMDBList(seed)
+		if err != nil {
+			continue
+		}
+		for _, movie := range tmdbResults {
+			if seenIDs[movie.ID] {
+				continue
+			}
+			seenIDs[movie.ID] = true
+			movie.Score = scoreMovieTitle(movie.Title, rawText)
+			log.Printf("[CANDIDATES] '%s' -> Score: %.2f", movie.Title, movie.Score)
+			candidates = append(candidates, movie)
+		}
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Score > candidates[j].Score
+	})
+
+	if len(candidates) > 10 {
+		candidates = candidates[:10]
+	}
+
+	return candidates
+}
+
+func handleSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+
+	var req SaveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "Invalid JSON", 400, err)
+		return
+	}
+
+	if req.Title == "" {
+		jsonError(w, "Title cannot be empty", 400, nil)
+		return
+	}
+
 	ctx := context.Background()
 	creds, err := os.ReadFile("credentials.json")
 	if err != nil {
@@ -446,20 +450,20 @@ func processAndSave(w http.ResponseWriter, tmdbData TMDBResult, format string) {
 	}
 
 	for _, row := range readRange.Values {
-		if len(row) > 0 && strings.EqualFold(fmt.Sprintf("%v", row[0]), tmdbData.Title) {
-			jsonError(w, "Movie already exists: "+tmdbData.Title, 409, nil)
+		if len(row) > 0 && strings.EqualFold(fmt.Sprintf("%v", row[0]), req.Title) {
+			jsonError(w, "Movie already exists: "+req.Title, 409, nil)
 			return
 		}
 	}
 
 	values := []interface{}{
-		tmdbData.Title,
-		format,
-		tmdbData.ReleaseDate,
-		tmdbData.Genres,
-		tmdbData.VoteAverage,
-		tmdbData.VoteCount,
-		"",
+		req.Title,
+		req.Format,
+		req.ReleaseDate,
+		req.Genres,
+		req.VoteAverage,
+		req.VoteCount,
+		req.Notes,
 	}
 
 	vr := &sheets.ValueRange{Values: [][]interface{}{values}}
@@ -469,12 +473,13 @@ func processAndSave(w http.ResponseWriter, tmdbData TMDBResult, format string) {
 		return
 	}
 
+	log.Printf("[SUCCESS] Saved '%s' (%s)", req.Title, req.Format)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":      "success",
-		"title":       tmdbData.Title,
-		"format":      format,
-		"releaseDate": tmdbData.ReleaseDate,
+		"title":       req.Title,
+		"format":      req.Format,
+		"releaseDate": req.ReleaseDate,
 	})
 }
 
@@ -716,11 +721,14 @@ func searchTMDBList(query string) ([]TMDBResult, error) {
 			}
 		}
 		results = append(results, TMDBResult{
+			ID:          res.ID,
 			Title:       res.Title,
 			ReleaseDate: res.ReleaseDate,
 			Genres:      strings.Join(genreNames, ", "),
 			VoteAverage: res.VoteAverage,
 			VoteCount:   res.VoteCount,
+			PosterPath:  res.PosterPath,
+			Overview:    res.Overview,
 		})
 	}
 

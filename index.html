@@ -18,7 +18,7 @@
         h1 { margin-bottom: 20px; font-size: 1.8rem; }
         
         /* Form Elements */
-        input[type="text"], input[type="password"], select { 
+        input[type="text"], input[type="password"], input[type="date"], input[type="number"], select {
             padding: 12px; 
             margin: 8px 0; 
             border-radius: 8px; 
@@ -86,8 +86,71 @@
         .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; display: block !important; }
         .processing { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; display: block !important; }
 
+        /* Textarea */
+        textarea {
+            padding: 12px;
+            margin: 4px 0 8px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+            width: 100%;
+            box-sizing: border-box;
+            font-size: 16px;
+            background: #fff;
+            font-family: inherit;
+            resize: vertical;
+        }
+
+        /* Form labels (confirmation section) */
+        .form-label {
+            display: block;
+            text-align: left;
+            font-weight: 600;
+            font-size: 13px;
+            color: #555;
+            margin: 10px 0 2px;
+        }
+
+        /* Candidate picker cards */
+        .candidate-card {
+            display: flex;
+            align-items: center;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            text-align: left;
+            transition: border-color 0.15s;
+        }
+        .candidate-card:hover { border-color: #007bff; }
+        .candidate-card.selected { border-color: #007bff; background: #f0f7ff; }
+        .candidate-poster {
+            width: 46px;
+            height: 69px;
+            border-radius: 4px;
+            object-fit: cover;
+            margin-right: 12px;
+            flex-shrink: 0;
+            background: #e9ecef;
+        }
+        .no-poster {
+            width: 46px;
+            height: 69px;
+            border-radius: 4px;
+            background: #e9ecef;
+            margin-right: 12px;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+        }
+        .candidate-info { flex: 1; min-width: 0; }
+        .candidate-title { font-weight: 600; font-size: 14px; color: #333; }
+        .candidate-meta { font-size: 12px; color: #666; margin-top: 2px; }
+
         /* Sections */
-        .section { 
+        .section {
             background: white; 
             padding: 20px; 
             margin-bottom: 20px; 
@@ -107,14 +170,40 @@
 
     <div id="status"></div>
 
-    <div class="section">
+    <div id="confirmSection" class="section" style="display:none;">
+        <h3>🔍 Confirm &amp; Edit</h3>
+        <div id="candidateList"></div>
+        <span class="form-label">Title</span>
+        <input type="text" id="confirmTitle">
+        <span class="form-label">Format</span>
+        <select id="confirmFormat">
+            <option value="Bluray">Bluray</option>
+            <option value="4K">4K Ultra HD</option>
+            <option value="DVD">DVD</option>
+            <option value="Unknown">Unknown</option>
+        </select>
+        <span class="form-label">Release Date</span>
+        <input type="date" id="confirmReleaseDate">
+        <span class="form-label">Genres</span>
+        <input type="text" id="confirmGenres">
+        <span class="form-label">Rating (0–10)</span>
+        <input type="number" id="confirmVoteAverage" step="0.1" min="0" max="10">
+        <span class="form-label">Vote Count</span>
+        <input type="number" id="confirmVoteCount" min="0">
+        <span class="form-label">Notes</span>
+        <textarea id="confirmNotes" rows="2" placeholder="Optional notes..."></textarea>
+        <button onclick="saveConfirmed()">✅ Confirm &amp; Save</button>
+        <button class="secondary" onclick="cancelConfirm()" style="margin-top:8px;">↩ Cancel</button>
+    </div>
+
+    <div class="section scan-section">
         <h3>🔤 Scan Barcode</h3>
         <div id="reader" style="width: 100%; display: none; margin-bottom: 15px;"></div>
         <button id="startBarcodeBtn" onclick="startBarcodeScanner()">Open Barcode Scanner</button>
         <button id="stopBarcodeBtn" onclick="stopBarcodeScanner()" class="secondary" style="display:none;">Cancel Scanner</button>
     </div>
 
-    <div class="section">
+    <div class="section scan-section">
         <h3>📷 OCR Cover Scan</h3>
         
         <label for="cameraInput" class="file-label">
@@ -127,7 +216,7 @@
         <button id="scanBtn" onclick="uploadPhoto()" disabled>Analyze Cover</button>
     </div>
 
-    <div class="section">
+    <div class="section scan-section">
         <h3>⌨️ Manual Entry</h3>
         <input type="text" id="manualInput" placeholder="Movie Title (e.g. The Matrix)">
         <select id="manualFormat">
@@ -146,6 +235,8 @@
         const status = document.getElementById('status');
         let selectedFile = null;
         let html5QrcodeScanner = null;
+        let currentCandidates = [];
+        let selectedCandidateIdx = 0;
 
         // --- AUTH LOGIC ---
         const urlSecret = window.location.pathname.substring(1); 
@@ -281,8 +372,12 @@
                 const result = await response.json();
 
                 if (response.ok) {
-					showStatus(`✅ <b>Success!</b><br>Added: ${result.title}<br>Format: ${result.format}<br>Date: ${result.releaseDate}`, "success");
-                    resetForm();
+                    if (result.candidates) {
+                        showConfirmation(result.candidates, result.format);
+                    } else {
+                        showStatus(`✅ <b>Success!</b><br>Added: ${result.title}<br>Format: ${result.format}<br>Date: ${result.releaseDate}`, "success");
+                        resetForm();
+                    }
                 } else {
                     showStatus(`❌ <b>Error:</b> ${result.error}`, "error");
                 }
@@ -312,6 +407,122 @@
                 selectedFile = null;
                 scanBtn.disabled = true;
             }
+        }
+
+        // --- CONFIRMATION STEP ---
+
+        function showConfirmation(candidates, defaultFormat) {
+            currentCandidates = candidates;
+            document.querySelectorAll('.scan-section').forEach(s => s.style.display = 'none');
+            document.getElementById('confirmSection').style.display = 'block';
+            showStatus('', 'hidden');
+            renderCandidates(candidates);
+            document.getElementById('confirmFormat').value = defaultFormat || 'Unknown';
+            if (candidates.length > 0) selectCandidate(0);
+            document.getElementById('confirmSection').scrollIntoView({ behavior: 'smooth' });
+        }
+
+        function cancelConfirm() {
+            document.getElementById('confirmSection').style.display = 'none';
+            document.querySelectorAll('.scan-section').forEach(s => s.style.display = 'block');
+            document.getElementById('confirmNotes').value = '';
+            showStatus('', 'hidden');
+            resetForm();
+        }
+
+        function renderCandidates(candidates) {
+            const list = document.getElementById('candidateList');
+            list.innerHTML = '';
+            candidates.forEach((c, i) => {
+                const card = document.createElement('div');
+                card.className = 'candidate-card';
+                card.onclick = () => selectCandidate(i);
+
+                const year = c.releaseDate ? c.releaseDate.substring(0, 4) : '?';
+                const posterUrl = c.posterPath
+                    ? `https://image.tmdb.org/t/p/w92${c.posterPath}`
+                    : null;
+
+                if (posterUrl) {
+                    const img = document.createElement('img');
+                    img.src = posterUrl;
+                    img.className = 'candidate-poster';
+                    img.alt = '';
+                    const fallback = document.createElement('div');
+                    fallback.className = 'no-poster';
+                    fallback.style.display = 'none';
+                    fallback.textContent = '🎬';
+                    img.onerror = () => { img.style.display = 'none'; fallback.style.display = 'flex'; };
+                    card.appendChild(img);
+                    card.appendChild(fallback);
+                } else {
+                    const placeholder = document.createElement('div');
+                    placeholder.className = 'no-poster';
+                    placeholder.textContent = '🎬';
+                    card.appendChild(placeholder);
+                }
+
+                const info = document.createElement('div');
+                info.className = 'candidate-info';
+                info.innerHTML = `<div class="candidate-title">${escHtml(c.title)} (${escHtml(year)})</div>
+                    <div class="candidate-meta">${escHtml(c.genres || '—')} · ⭐ ${c.voteAverage.toFixed(1)}</div>`;
+                card.appendChild(info);
+                list.appendChild(card);
+            });
+        }
+
+        function selectCandidate(idx) {
+            selectedCandidateIdx = idx;
+            document.querySelectorAll('.candidate-card').forEach((c, i) =>
+                c.classList.toggle('selected', i === idx));
+            const c = currentCandidates[idx];
+            document.getElementById('confirmTitle').value = c.title || '';
+            document.getElementById('confirmReleaseDate').value = c.releaseDate || '';
+            document.getElementById('confirmGenres').value = c.genres || '';
+            document.getElementById('confirmVoteAverage').value = c.voteAverage || '';
+            document.getElementById('confirmVoteCount').value = c.voteCount || '';
+            // format and notes are intentionally not overwritten on candidate switch
+        }
+
+        async function saveConfirmed() {
+            const title = document.getElementById('confirmTitle').value.trim();
+            if (!title) { showStatus('Please enter a title.', 'error'); return; }
+            const secret = secretInput.value;
+            if (!secret) { showStatus('Please enter the App Secret first.', 'error'); return; }
+
+            showStatus('Saving...', 'processing');
+            try {
+                const response = await fetch('/api/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-App-Secret': secret },
+                    body: JSON.stringify({
+                        title,
+                        format: document.getElementById('confirmFormat').value,
+                        releaseDate: document.getElementById('confirmReleaseDate').value,
+                        genres: document.getElementById('confirmGenres').value,
+                        voteAverage: parseFloat(document.getElementById('confirmVoteAverage').value) || 0,
+                        voteCount: parseInt(document.getElementById('confirmVoteCount').value) || 0,
+                        notes: document.getElementById('confirmNotes').value,
+                    }),
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    showStatus(`✅ <b>Success!</b><br>Added: ${result.title}<br>Format: ${result.format}<br>Date: ${result.releaseDate}`, 'success');
+                    cancelConfirm();
+                } else {
+                    // On 409 (duplicate) stay in confirm mode so user can edit the title
+                    showStatus(`❌ <b>Error:</b> ${result.error}`, 'error');
+                }
+            } catch (err) {
+                showStatus('❌ Network Error. Check your connection or server logs.', 'error');
+                console.error(err);
+            }
+        }
+
+        function escHtml(str) {
+            return String(str)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         }
     </script>
 </body>
