@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
 	"google.golang.org/api/option"
 	"google.golang.org/api/sheets/v4"
 	"google.golang.org/api/vision/v1"
@@ -93,11 +94,6 @@ func authMiddleware(next http.Handler) http.Handler {
 }
 
 // -- HANDLERS --
-
-type SearchRequest struct {
-	Query  string `json:"query"`
-	Format string `json:"format"`
-}
 
 func handleSearch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -216,23 +212,6 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	processAndSave(w, bestMatch, detectedFormat)
 }
 
-// --- NEW BARCODE LOGIC ---
-type BarcodeRequest struct {
-	UPC string `json:"upc"`
-}
-
-type UPCItemDBResponse struct {
-	Items []struct {
-		Title string `json:"title"`
-	} `json:"items"`
-}
-
-type GinzaResponse struct {
-	Result []struct {
-		Text string `json:"Text"`
-	} `json:"Result"`
-}
-
 func handleBarcode(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", 405)
@@ -297,6 +276,7 @@ func handleBarcode(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
+		spew.Dump(tmdbResults)
 
 		for _, movie := range tmdbResults {
 			if searchedMovies[movie.Title] {
@@ -325,44 +305,123 @@ func handleBarcode(w http.ResponseWriter, r *http.Request) {
 }
 
 func lookupUPC(upc string) (string, error) {
-	// 1. Try upcitemdb (Primary Source)
-	resp1, err := http.Get("https://api.upcitemdb.com/prod/trial/lookup?upc=" + upc)
-	if err == nil {
-		defer resp1.Body.Close()
-		var data UPCItemDBResponse
-		if err := json.NewDecoder(resp1.Body).Decode(&data); err == nil {
-			if len(data.Items) > 0 && data.Items[0].Title != "" {
-				log.Printf("[UPC] Found on upcitemdb")
-				return data.Items[0].Title, nil
-			}
-		}
+	if title, err := lookupUPCItemDB(upc); err == nil {
+		return title, nil
 	}
-
-	// 2. Try ginza.se (Fallback Source)
 	log.Printf("[UPC] Falling back to ginza.se for %s", upc)
-	client := &http.Client{}
+	if title, err := lookupGinza(upc); err == nil {
+		return title, nil
+	}
+	log.Printf("[UPC] Falling back to kvarnvideo.se for %s", upc)
+	if title, err := lookupKvarnvideo(upc); err == nil {
+		return title, nil
+	}
+	return "", fmt.Errorf("barcode not found")
+}
+
+func lookupUPCItemDB(upc string) (string, error) {
+	resp, err := http.Get("https://api.upcitemdb.com/prod/trial/lookup?upc=" + upc)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var data UPCItemDBResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", err
+	}
+	if len(data.Items) == 0 || data.Items[0].Title == "" {
+		return "", fmt.Errorf("not found")
+	}
+	log.Printf("[UPC] Found on upcitemdb")
+	return data.Items[0].Title, nil
+}
+
+func lookupGinza(upc string) (string, error) {
 	req, err := http.NewRequest("GET", "https://www.ginza.se/api/Apptus/Autocomplete?searchPrefix="+upc, nil)
-	if err == nil {
-		// Mimic headers exactly from the provided curl
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("accept", "*/*")
+	req.Header.Set("accept-language", "en-GB,en;q=0.9,sv-SE;q=0.8,sv;q=0.7,en-US;q=0.6")
+	req.Header.Set("referer", "https://www.ginza.se/")
+	req.Header.Set("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+	req.Header.Set("x-requested-with", "XMLHttpRequest")
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var data GinzaResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", err
+	}
+	if len(data.Result) == 0 || data.Result[0].Text == "" {
+		return "", fmt.Errorf("not found")
+	}
+	log.Printf("[UPC] Found on ginza.se")
+	return data.Result[0].Text, nil
+}
+
+func lookupKvarnvideo(upc string) (string, error) {
+	const apiURL = "https://www.kvarnvideo.se/backend/jsonrpc/v1?webshop=4862&auth=&session=&language=sv&vat_country=SE"
+	setHeaders := func(req *http.Request) {
 		req.Header.Set("accept", "*/*")
 		req.Header.Set("accept-language", "en-GB,en;q=0.9,sv-SE;q=0.8,sv;q=0.7,en-US;q=0.6")
-		req.Header.Set("referer", "https://www.ginza.se/")
-		req.Header.Set("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
-		req.Header.Set("x-requested-with", "XMLHttpRequest")
-
-		resp2, err := client.Do(req)
-		if err == nil {
-			defer resp2.Body.Close()
-			var ginzaData GinzaResponse
-			if err := json.NewDecoder(resp2.Body).Decode(&ginzaData); err == nil {
-				if len(ginzaData.Result) > 0 && ginzaData.Result[0].Text != "" {
-					return ginzaData.Result[0].Text, nil
-				}
-			}
-		}
+		req.Header.Set("content-type", "text/plain;charset=UTF-8")
+		req.Header.Set("origin", "https://www.kvarnvideo.se")
+		req.Header.Set("referer", "https://www.kvarnvideo.se/sok/")
+		req.Header.Set("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
 	}
 
-	return "", fmt.Errorf("barcode not found")
+	client := &http.Client{}
+
+	searchBody := fmt.Sprintf(`{"id":15,"jsonrpc":"2.0","method":"Article.search","params":["%s",13]}`, upc)
+	searchReq, err := http.NewRequest("POST", apiURL, strings.NewReader(searchBody))
+	if err != nil {
+		return "", err
+	}
+	setHeaders(searchReq)
+
+	searchResp, err := client.Do(searchReq)
+	if err != nil {
+		return "", err
+	}
+	defer searchResp.Body.Close()
+	var searchData KvarnvideoSearchResponse
+	if err := json.NewDecoder(searchResp.Body).Decode(&searchData); err != nil {
+		return "", err
+	}
+	if len(searchData.Result) == 0 {
+		return "", fmt.Errorf("not found")
+	}
+
+	uid := searchData.Result[0]
+	listBody := fmt.Sprintf(`{"id":16,"jsonrpc":"2.0","method":"Article.list","params":[{"uid":true,"name":"sv","images":true,"url":"sv"},{"filters":{"/uid":{"in":[%d]}},"limit":13}]}`, uid)
+	listReq, err := http.NewRequest("POST", apiURL, strings.NewReader(listBody))
+	if err != nil {
+		return "", err
+	}
+	setHeaders(listReq)
+
+	listResp, err := client.Do(listReq)
+	if err != nil {
+		return "", err
+	}
+	defer listResp.Body.Close()
+	var listData KvarnvideoListResponse
+	if err := json.NewDecoder(listResp.Body).Decode(&listData); err != nil {
+		return "", err
+	}
+	if len(listData.Result) == 0 {
+		return "", fmt.Errorf("not found")
+	}
+	title, ok := listData.Result[0].Name["sv"]
+	if !ok || title == "" {
+		return "", fmt.Errorf("not found")
+	}
+	log.Printf("[UPC] Found on kvarnvideo.se")
+	return title, nil
 }
 
 // -- CORE LOGIC --
@@ -404,7 +463,7 @@ func processAndSave(w http.ResponseWriter, tmdbData TMDBResult, format string) {
 	}
 
 	vr := &sheets.ValueRange{Values: [][]interface{}{values}}
-	_, err = sheetsService.Spreadsheets.Values.Append(SpreadsheetID, "Sheet1!A1", vr).ValueInputOption("RAW").Do()
+	_, err = sheetsService.Spreadsheets.Values.Append(SpreadsheetID, "Sheet1!A1", vr).ValueInputOption("USER_ENTERED").Do()
 	if err != nil {
 		jsonError(w, "Failed to write to Sheet", 500, err)
 		return
@@ -420,11 +479,6 @@ func processAndSave(w http.ResponseWriter, tmdbData TMDBResult, format string) {
 }
 
 // -- NLP PATH 2 HELPERS --
-
-type TextBlock struct {
-	Text string
-	Area int
-}
 
 func getSeedQueries(annotation *vision.TextAnnotation) []string {
 	var blocks []TextBlock
@@ -620,22 +674,6 @@ func levenshtein(s, t string) int {
 }
 
 // -- TMDB API --
-
-type TMDBResult struct {
-	Title, ReleaseDate, Genres string
-	VoteAverage                float64
-	VoteCount                  int
-}
-
-type TMDBResponse struct {
-	Results []struct {
-		Title       string
-		ReleaseDate string  `json:"release_date"`
-		GenreIDs    []int   `json:"genre_ids"`
-		VoteAverage float64 `json:"vote_average"`
-		VoteCount   int     `json:"vote_count"`
-	}
-}
 
 func searchTMDBList(query string) ([]TMDBResult, error) {
 	q := url.QueryEscape(query)
