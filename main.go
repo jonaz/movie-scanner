@@ -28,6 +28,14 @@ var TmdbApiKey string
 var AppSecret string
 var SpreadsheetID string
 
+var genreMap = map[int]string{
+	28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy",
+	80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family",
+	14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music",
+	9648: "Mystery", 10749: "Romance", 878: "Sci-Fi", 10770: "TV Movie",
+	53: "Thriller", 10752: "War", 37: "Western",
+}
+
 // -- EMBEDDED FRONTEND --
 //
 //go:embed index.html
@@ -97,7 +105,7 @@ func authMiddleware(next http.Handler) http.Handler {
 
 func handleSearch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", 405)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -127,14 +135,13 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		return results[i].Score > results[j].Score
 	})
 
-	markOwned(results, fetchOwnedTitles())
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(CandidatesResponse{Candidates: results, Format: req.Format})
+	markOwned(results)
+	writeJSON(w, CandidatesResponse{Candidates: results, Format: req.Format})
 }
 
 func handleScan(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", 405)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -192,14 +199,13 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[SUCCESS] Best Scan Match: '%s' (Score: %.2f)", candidates[0].Title, candidates[0].Score)
-	markOwned(candidates, fetchOwnedTitles())
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(CandidatesResponse{Candidates: candidates, Format: detectedFormat})
+	markOwned(candidates)
+	writeJSON(w, CandidatesResponse{Candidates: candidates, Format: detectedFormat})
 }
 
 func handleBarcode(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", 405)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -258,9 +264,8 @@ func handleBarcode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[SUCCESS] Best UPC Match: '%s' (Score: %.2f)", candidates[0].Title, candidates[0].Score)
-	markOwned(candidates, fetchOwnedTitles())
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(CandidatesResponse{Candidates: candidates, Format: detectedFormat})
+	markOwned(candidates)
+	writeJSON(w, CandidatesResponse{Candidates: candidates, Format: detectedFormat})
 }
 
 func lookupUPC(upc string) (string, error) {
@@ -418,7 +423,7 @@ func collectCandidates(seeds []string, rawText string) []TMDBResult {
 
 func handleSave(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", 405)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -433,52 +438,32 @@ func handleSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	creds, err := os.ReadFile("credentials.json")
-	if err != nil {
-		jsonError(w, "Missing credentials.json", 500, err)
-		return
-	}
-
-	sheetsService, err := sheets.NewService(ctx, option.WithCredentialsJSON(creds))
+	svc, err := newSheetsService()
 	if err != nil {
 		jsonError(w, "Failed to connect to Sheets API", 500, err)
 		return
 	}
 
-	readRange, err := sheetsService.Spreadsheets.Values.Get(SpreadsheetID, SheetRange).Do()
+	owned, err := readOwnedTitles(svc)
 	if err != nil {
 		jsonError(w, "Failed to read Sheet", 500, err)
 		return
 	}
-
-	for _, row := range readRange.Values {
-		if len(row) > 0 && strings.EqualFold(fmt.Sprintf("%v", row[0]), req.Title) {
-			jsonError(w, "Movie already exists: "+req.Title, 409, nil)
-			return
-		}
+	if owned[strings.ToLower(req.Title)] {
+		jsonError(w, "Movie already exists: "+req.Title, 409, nil)
+		return
 	}
 
-	values := []interface{}{
-		req.Title,
-		req.Format,
-		req.ReleaseDate,
-		req.Genres,
-		req.VoteAverage,
-		req.VoteCount,
-		req.Notes,
-	}
-
-	vr := &sheets.ValueRange{Values: [][]interface{}{values}}
-	_, err = sheetsService.Spreadsheets.Values.Append(SpreadsheetID, "Sheet1!A1", vr).ValueInputOption("USER_ENTERED").Do()
+	row := []any{req.Title, req.Format, req.ReleaseDate, req.Genres, req.VoteAverage, req.VoteCount, req.Notes}
+	vr := &sheets.ValueRange{Values: [][]any{row}}
+	_, err = svc.Spreadsheets.Values.Append(SpreadsheetID, "Sheet1!A1", vr).ValueInputOption("USER_ENTERED").Do()
 	if err != nil {
 		jsonError(w, "Failed to write to Sheet", 500, err)
 		return
 	}
 
 	log.Printf("[SUCCESS] Saved '%s' (%s)", req.Title, req.Format)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, map[string]any{
 		"status":      "success",
 		"title":       req.Title,
 		"format":      req.Format,
@@ -486,37 +471,41 @@ func handleSave(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// fetchOwnedTitles returns a set of lowercased titles already in the sheet.
-// Returns nil (and logs the error) so callers still work if the sheet is unreachable.
-func fetchOwnedTitles() map[string]bool {
-	ctx := context.Background()
+// newSheetsService creates a Google Sheets client using credentials.json.
+func newSheetsService() (*sheets.Service, error) {
 	creds, err := os.ReadFile("credentials.json")
 	if err != nil {
-		log.Printf("[WARN] fetchOwnedTitles: cannot read credentials: %v", err)
-		return nil
+		return nil, err
 	}
-	sheetsService, err := sheets.NewService(ctx, option.WithCredentialsJSON(creds))
+	return sheets.NewService(context.Background(), option.WithCredentialsJSON(creds))
+}
+
+// readOwnedTitles returns a set of lowercased titles from column A of the sheet.
+func readOwnedTitles(svc *sheets.Service) (map[string]bool, error) {
+	rng, err := svc.Spreadsheets.Values.Get(SpreadsheetID, SheetRange).Do()
 	if err != nil {
-		log.Printf("[WARN] fetchOwnedTitles: cannot connect to Sheets: %v", err)
-		return nil
+		return nil, err
 	}
-	readRange, err := sheetsService.Spreadsheets.Values.Get(SpreadsheetID, SheetRange).Do()
-	if err != nil {
-		log.Printf("[WARN] fetchOwnedTitles: cannot read sheet: %v", err)
-		return nil
-	}
-	owned := make(map[string]bool, len(readRange.Values))
-	for _, row := range readRange.Values {
+	owned := make(map[string]bool, len(rng.Values))
+	for _, row := range rng.Values {
 		if len(row) > 0 {
 			owned[strings.ToLower(fmt.Sprintf("%v", row[0]))] = true
 		}
 	}
-	return owned
+	return owned, nil
 }
 
-// markOwned sets Exists=true on any candidate whose title is already in the sheet.
-func markOwned(results []TMDBResult, owned map[string]bool) {
-	if owned == nil {
+// markOwned flags candidates already in the sheet. Best-effort: logs and returns
+// on any error so search still works when the sheet is unreachable.
+func markOwned(results []TMDBResult) {
+	svc, err := newSheetsService()
+	if err != nil {
+		log.Printf("[WARN] markOwned: %v", err)
+		return
+	}
+	owned, err := readOwnedTitles(svc)
+	if err != nil {
+		log.Printf("[WARN] markOwned: %v", err)
 		return
 	}
 	for i := range results {
@@ -524,6 +513,12 @@ func markOwned(results []TMDBResult, owned map[string]bool) {
 			results[i].Exists = true
 		}
 	}
+}
+
+// writeJSON writes a JSON response with Content-Type set.
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
 }
 
 // -- NLP PATH 2 HELPERS --
@@ -541,18 +536,8 @@ func getSeedQueries(annotation *vision.TextAnnotation) []string {
 				minX, maxX := v[0].X, v[0].X
 				minY, maxY := v[0].Y, v[0].Y
 				for _, pt := range v {
-					if pt.X < minX {
-						minX = pt.X
-					}
-					if pt.X > maxX {
-						maxX = pt.X
-					}
-					if pt.Y < minY {
-						minY = pt.Y
-					}
-					if pt.Y > maxY {
-						maxY = pt.Y
-					}
+					minX, maxX = min(minX, pt.X), max(maxX, pt.X)
+					minY, maxY = min(minY, pt.Y), max(maxY, pt.Y)
 				}
 				area := int((maxX - minX) * (maxY - minY))
 
@@ -708,14 +693,7 @@ func levenshtein(s, t string) int {
 			if s[i] == t[j] {
 				cost = 0
 			}
-			min := d[i][j+1] + 1
-			if d[i+1][j]+1 < min {
-				min = d[i+1][j] + 1
-			}
-			if d[i][j]+cost < min {
-				min = d[i][j] + cost
-			}
-			d[i+1][j+1] = min
+			d[i+1][j+1] = min(d[i][j+1]+1, d[i+1][j]+1, d[i][j]+cost)
 		}
 	}
 	return d[len(s)][len(t)]
@@ -741,19 +719,8 @@ func searchTMDBList(query string) ([]TMDBResult, error) {
 		return nil, fmt.Errorf("no results")
 	}
 
-	genreMap := map[int]string{
-		28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy",
-		80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family",
-		14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music",
-		9648: "Mystery", 10749: "Romance", 878: "Sci-Fi", 10770: "TV Movie",
-		53: "Thriller", 10752: "War", 37: "Western",
-	}
-
 	var results []TMDBResult
-	limit := 5
-	if len(data.Results) < 5 {
-		limit = len(data.Results)
-	}
+	limit := min(5, len(data.Results))
 
 	for i := 0; i < limit; i++ {
 		res := data.Results[i]
