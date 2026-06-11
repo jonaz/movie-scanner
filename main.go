@@ -127,6 +127,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		return results[i].Score > results[j].Score
 	})
 
+	markOwned(results, fetchOwnedTitles())
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(CandidatesResponse{Candidates: results, Format: req.Format})
 }
@@ -191,6 +192,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[SUCCESS] Best Scan Match: '%s' (Score: %.2f)", candidates[0].Title, candidates[0].Score)
+	markOwned(candidates, fetchOwnedTitles())
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(CandidatesResponse{Candidates: candidates, Format: detectedFormat})
 }
@@ -256,6 +258,7 @@ func handleBarcode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[SUCCESS] Best UPC Match: '%s' (Score: %.2f)", candidates[0].Title, candidates[0].Score)
+	markOwned(candidates, fetchOwnedTitles())
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(CandidatesResponse{Candidates: candidates, Format: detectedFormat})
 }
@@ -481,6 +484,46 @@ func handleSave(w http.ResponseWriter, r *http.Request) {
 		"format":      req.Format,
 		"releaseDate": req.ReleaseDate,
 	})
+}
+
+// fetchOwnedTitles returns a set of lowercased titles already in the sheet.
+// Returns nil (and logs the error) so callers still work if the sheet is unreachable.
+func fetchOwnedTitles() map[string]bool {
+	ctx := context.Background()
+	creds, err := os.ReadFile("credentials.json")
+	if err != nil {
+		log.Printf("[WARN] fetchOwnedTitles: cannot read credentials: %v", err)
+		return nil
+	}
+	sheetsService, err := sheets.NewService(ctx, option.WithCredentialsJSON(creds))
+	if err != nil {
+		log.Printf("[WARN] fetchOwnedTitles: cannot connect to Sheets: %v", err)
+		return nil
+	}
+	readRange, err := sheetsService.Spreadsheets.Values.Get(SpreadsheetID, SheetRange).Do()
+	if err != nil {
+		log.Printf("[WARN] fetchOwnedTitles: cannot read sheet: %v", err)
+		return nil
+	}
+	owned := make(map[string]bool, len(readRange.Values))
+	for _, row := range readRange.Values {
+		if len(row) > 0 {
+			owned[strings.ToLower(fmt.Sprintf("%v", row[0]))] = true
+		}
+	}
+	return owned
+}
+
+// markOwned sets Exists=true on any candidate whose title is already in the sheet.
+func markOwned(results []TMDBResult, owned map[string]bool) {
+	if owned == nil {
+		return
+	}
+	for i := range results {
+		if owned[strings.ToLower(results[i].Title)] {
+			results[i].Exists = true
+		}
+	}
 }
 
 // -- NLP PATH 2 HELPERS --

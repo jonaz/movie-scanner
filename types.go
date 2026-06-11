@@ -63,6 +63,7 @@ type TMDBResult struct {
 	PosterPath  string  `json:"posterPath,omitempty"`
 	Overview    string  `json:"overview,omitempty"`
 	Score       float64 `json:"score"`
+	Exists      bool    `json:"exists"`
 }
 
 type TMDBResponse struct {

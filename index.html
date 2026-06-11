@@ -124,6 +124,9 @@
         }
         .candidate-card:hover { border-color: #007bff; }
         .candidate-card.selected { border-color: #007bff; background: #f0f7ff; }
+        .candidate-card.exists { border-color: #dc3545; background: #fff5f5; cursor: not-allowed; opacity: 0.7; }
+        .candidate-card.exists:hover { border-color: #dc3545; }
+        .exists-badge { font-size: 11px; color: #dc3545; font-weight: 600; margin-top: 2px; }
         .candidate-poster {
             width: 46px;
             height: 69px;
@@ -148,6 +151,7 @@
         .candidate-info { flex: 1; min-width: 0; }
         .candidate-title { font-weight: 600; font-size: 14px; color: #333; }
         .candidate-meta { font-size: 12px; color: #666; margin-top: 2px; }
+        .candidate-meta a { text-decoration: none; color: inherit; }
 
         /* Sections */
         .section {
@@ -249,6 +253,9 @@
         }
         secretInput.addEventListener('change', () => {
             localStorage.setItem('movieAppSecret', secretInput.value);
+        });
+        document.getElementById('manualInput').addEventListener('keydown', e => {
+            if (e.key === 'Enter') manualSearch();
         });
 
 		// --- BARCODE SCANNER LOGIC ---
@@ -418,7 +425,8 @@
             showStatus('', 'hidden');
             renderCandidates(candidates);
             document.getElementById('confirmFormat').value = defaultFormat || 'Unknown';
-            if (candidates.length > 0) selectCandidate(0);
+            const firstAvailable = candidates.findIndex(c => !c.exists);
+            if (firstAvailable !== -1) selectCandidate(firstAvailable);
             document.getElementById('confirmSection').scrollIntoView({ behavior: 'smooth' });
         }
 
@@ -436,7 +444,11 @@
             candidates.forEach((c, i) => {
                 const card = document.createElement('div');
                 card.className = 'candidate-card';
-                card.onclick = () => selectCandidate(i);
+                if (c.exists) {
+                    card.classList.add('exists');
+                } else {
+                    card.onclick = () => selectCandidate(i);
+                }
 
                 const year = c.releaseDate ? c.releaseDate.substring(0, 4) : '?';
                 const posterUrl = c.posterPath
@@ -464,14 +476,17 @@
 
                 const info = document.createElement('div');
                 info.className = 'candidate-info';
+                const badge = c.exists ? `<div class="exists-badge">Already in collection</div>` : '';
+                const tmdbUrl = `https://www.themoviedb.org/movie/${c.id}`;
                 info.innerHTML = `<div class="candidate-title">${escHtml(c.title)} (${escHtml(year)})</div>
-                    <div class="candidate-meta">${escHtml(c.genres || '—')} · ⭐ ${c.voteAverage.toFixed(1)}</div>`;
+                    <div class="candidate-meta">${escHtml(c.genres || '—')} · <a href="${tmdbUrl}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">⭐ ${c.voteAverage.toFixed(1)}</a></div>${badge}`;
                 card.appendChild(info);
                 list.appendChild(card);
             });
         }
 
         function selectCandidate(idx) {
+            if (currentCandidates[idx]?.exists) return;
             selectedCandidateIdx = idx;
             document.querySelectorAll('.candidate-card').forEach((c, i) =>
                 c.classList.toggle('selected', i === idx));
